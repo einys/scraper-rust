@@ -3,20 +3,18 @@ use scraper::{Html, Node};
 pub fn extract_clean_dom(html_content: &str) -> String {
     let document = Html::parse_document(html_content);
 
-    // 제거할 태그 목록 (대소문자 구분 없이 비교하기 위해 소문자로 정의)
+    // 제거할 노이즈 태그 목록 (소문자)
     let noise_tags = [
-        "script", "style", "noscript", "svg", "iframe", "header", "footer", "style", "link",
+        "script", "style", "noscript", "svg", "iframe", "header", "footer", "link",
     ];
 
     let mut texts = Vec::new();
 
-    // DOM 트리의 노드를 순회
+    // DOM 트리의 모든 노드 순회
     for node in document.tree.nodes() {
-        // 현재 노드가 Element(태그)인 경우
-        if let Node::Element(ref element) = node.value() {
-            let tag_name = element.name().to_lowercase();
-
-            // 상위 부모 노드 중 노이즈 태그가 하나라도 포함되어 있는지 확인
+        // 텍스트 노드(Node::Text)인 경우에만 직접 검사
+        if let Node::Text(ref text) = node.value() {
+            // 텍스트 노드의 부모 태그(ancestors) 중 노이즈 태그가 포함되어 있는지 확인
             let is_inside_noise = node.ancestors().any(|ancestor| {
                 if let Node::Element(ref parent_element) = ancestor.value() {
                     noise_tags.contains(&parent_element.name().to_lowercase().as_str())
@@ -25,22 +23,37 @@ pub fn extract_clean_dom(html_content: &str) -> String {
                 }
             });
 
-            // 노이즈 태그 내부가 아닌 경우의 텍스트 노드 처리
+            // 노이즈 태그 내부가 아닌 본문 텍스트만 수집
             if !is_inside_noise {
-                // 직계 자식 텍스트만 수집 (재귀적 수집 방지)
-                for child in node.children() {
-                    if let Node::Text(ref text) = child.value() {
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            texts.push(trimmed.to_string());
-                        }
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    texts.push(trimmed.to_string());
+                }
+            }
+        }
+
+        // 이미지 태그(Node::Element)인 경우에만 직접 검사
+        if let Node::Element(ref element) = node.value() {
+            if element.name() == "img" {
+                // 이미지 태그의 부모 태그(ancestors) 중 노이즈 태그가 포함되어 있는지 확인
+                let is_inside_noise = node.ancestors().any(|ancestor| {
+                    if let Node::Element(ref parent_element) = ancestor.value() {
+                        noise_tags.contains(&parent_element.name().to_lowercase().as_str())
+                    } else {
+                        false
+                    }
+                });
+
+                // 노이즈 태그 내부가 아닌 이미지 태그만 수집
+                if !is_inside_noise {
+                    if let Some(src) = element.attr("src") {
+                        texts.push(src.to_string());
                     }
                 }
             }
         }
     }
 
-    // 공백으로 이어붙이기 (필요시 \n으로 구분 가능)
     texts.join(" ")
 }
 

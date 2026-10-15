@@ -288,3 +288,15 @@ let ollama = Ollama::new("http://localhost".to_string(), 31434);
         Candle 역시 CUDA/Metal 지원이 계속 발전하고 있으나, 특정 Quantization(Q4_K_M 등) 및 Prompt Processing 속도 면에서는 llama.cpp 대비 약간 뒤처지는 편입니다.
 
 현재 하고 계신 "Rust 기반 브라우저 자동화 스크래퍼 → K8s Ollama(31434 포트) 호출" 파이프라인의 경우, Ollama NodePort 통신 방식을 유지하시는 것이 개발 및 유지보수 생산성 측면에서 훨씬 유리합니다.
+
+# Agent가 한 선택 결과의 Reasoning
+
+웹 자동화 에이전트라면 1번의 reasoning 필드와 행동 결과 로그를 먼저 구현하는 편을 추천해. 실제로 필요한 정보는 대개 다음과 같거든.
+
+- 어떤 DOM 요소를 근거로 선택했는가?
+- 왜 클릭하거나 스크롤하기로 결정했는가?
+- 이전 행동이 성공했는가?
+- 다음 행동을 결정할 때 어떤 정보가 부족한가?
+  이런 정보는 자연어 reasoning만으로 해결하기보다 구조화된 로그로 기록하면 훨씬 분석하기 편해.
+  예를 들어 action, selector, observation, result, error를 기록하면 행동 실패를 추적하기 쉬워져.
+  반대로 Qwen3가 생성하는 <think> 블록 자체를 관찰하는 것이 목적이라면 2번을 테스트할 가치가 있어. 단, 먼저 현재 Ollama API 응답에서 thinking 내용이 실제로 노출되는지 확인해야 해.
