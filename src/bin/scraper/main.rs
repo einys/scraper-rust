@@ -122,6 +122,7 @@ pub enum LoopControl {
     Finish,
 }
 
+// Agent의 행동을 미리 정의해놓고 분기로 알맞게 선택해서 실행함
 pub async fn handle_action(
     action: AgentAction,
     page: &impl PageTrait,
@@ -347,6 +348,8 @@ async fn main() -> DynResult<()> {
     );
 
     let request = GenerationRequest::new(model, prompt);
+
+    // TODO: 여기서부터 새로 짜야됨 지금 꼬여있음
 
     let page = browser.new_page("https://cmsn.info").await?;
     page.wait_for_navigation().await?;

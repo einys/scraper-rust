@@ -15,6 +15,7 @@ ollama pull llama3.2
 ```sh
 API_URL="http://localhost:8000/api/status" \
 OLLAMA_MODEL="llama3.2" \
+OLLAMA_HOST="http://localhost:31434"
 POLL_INTERVAL_SECS=300 \
 ANALYSIS_INTERVAL_SECS=3600 \
 cargo run --release
@@ -30,3 +31,13 @@ cargo run --release
 | `REQUEST_TIMEOUT_SECS`   | `10`                               | 대상 API 요청 타임아웃(초)        |
 
 첫 주기는 시작 직후 실행됩니다. API 응답 본문은 프롬프트에 포함할 때 최대 12,000자로 제한합니다. Ollama 요청 타임아웃은 120초이며, 한 주기가 길어져도 밀린 조회를 연속 실행하지 않습니다.
+
+# Test
+
+```
+RUST_BACKTRACE=1 cargo test --bin scraper lib::page::tests::test_get_element_rect -- --nocapture
+```
+
+```
+cargo test
+```
