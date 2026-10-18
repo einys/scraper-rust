@@ -1,21 +1,43 @@
 use chromiumoxide::Page;
 use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
 use serde::Deserialize;
+use serde::Serialize;
+use std::collections::HashMap;
 use std::error::Error;
 use tokio::test;
 
-#[derive(Deserialize, Debug)]
-struct ElementRect {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+use crate::lib::dyn_result::DynError;
+use crate::lib::dyn_result::DynResult;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElementRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
-async fn get_element_rect(
-    page: &Page,
+/// Selector 단위 추출 정보 (위치 + 원본 내용)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedElementInfo {
+    pub selector: String,
+    pub text_content: Option<String>,
+    pub outer_html: Option<String>,
+    pub rect: Option<ElementRect>,
+}
+
+/// 최종 JSON 결과 (필드명 -> ExtractedElementInfo)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionResult {
+    pub data: HashMap<String, ExtractedElementInfo>,
+}
+use serde_json::Value;
+
+// selector 받고 -> 내용, 원본, x y 좌표 담긴 구조체 리턴
+pub async fn get_element_info(
+    page: &chromiumoxide::Page,
     selector: &str,
-) -> Result<Option<ElementRect>, Box<dyn Error>> {
+) -> Result<Option<ExtractedElementInfo>, DynError> {
     // JS 문자열 이스케이프 및 안전성을 위해 JSON.stringify 사용
     let selector_json = serde_json::to_string(selector)?;
 
@@ -26,21 +48,73 @@ async fn get_element_rect(
             if (!el) return null;
             const rect = el.getBoundingClientRect();
             return {{
-                x: rect.x + window.scrollX,
-                y: rect.y + window.scrollY,
-                width: rect.width,
-                height: rect.height
+                selector: {selector_json},
+                text_content: el.innerText ? el.innerText.trim() : el.textContent.trim(),
+                outer_html: el.outerHTML,
+                rect: {{
+                    x: rect.x + window.scrollX,
+                    y: rect.y + window.scrollY,
+                    width: rect.width,
+                    height: rect.height
+                }}
             }};
         }})()
         "#
     );
 
-    // null인 경우 deserialization 에러를 피하고 Option<ElementRect>로 매핑
-    let result: Option<ElementRect> = page.evaluate(js_script).await?.into_value()?;
-    // Option<ElementRect> 반환):
-    // serde가 JS의 null을 Rust의 None으로 자연스럽게 변환합니다.
-    // 요소를 찾지 못한 상황이 정상적인 흐름(Ok(None))으로 처리되어, match나 if let Some() 문으로 깔끔하게 대응할 수 있습니다.
+    // null인 경우 deserialization 에러를 피하고 Option<ExtractedElementInfo>로 매핑
+    let result: Option<ExtractedElementInfo> = page.evaluate(js_script).await?.into_value()?;
     Ok(result)
+}
+
+/// 리턴: json형식의 '문자열'. LLM Selector 결과와 브라우저 Page를 받아 위치 및 내용이 통합된 JSON 결과를 반환합니다.
+pub async fn extract_data_with_selectors(
+    page: &chromiumoxide::Page,
+    llm_selector_json_str: &str,
+) -> Result<String, DynError> {
+    // LLM 결과에서 JSON 부분 추출 (마크다운 ```json ... ``` 응답 대응)
+    let clean_json_str = parse_json_from_llm_response(llm_selector_json_str);
+
+    // Dynamic JSON 파싱 (필드명 -> Selector 문자열)
+    let selectors_map: HashMap<String, Value> = serde_json::from_str(&clean_json_str)?;
+    let mut final_data: HashMap<String, ExtractedElementInfo> = HashMap::new();
+
+    for (field_name, selector_val) in selectors_map {
+        if let Some(selector) = selector_val.as_str() {
+            // 위치와 내용 원본을 한 번의 JS call로 취득
+            if let Ok(Some(element_info)) = get_element_info(page, selector).await {
+                final_data.insert(field_name, element_info);
+            } else {
+                // 요소를 찾지 못했거나 에러인 경우 None으로 채워 반환 구조 유지
+                final_data.insert(
+                    field_name,
+                    ExtractedElementInfo {
+                        selector: selector.to_string(),
+                        text_content: None,
+                        outer_html: None,
+                        rect: None,
+                    },
+                );
+            }
+        }
+    }
+
+    let extraction_result = ExtractionResult { data: final_data };
+
+    // 예쁘게 정렬된 JSON 문자열로 반환
+    let json_output = serde_json::to_string_pretty(&extraction_result)?;
+    Ok(json_output)
+}
+
+/// LLM 응답에 섞인 마크다운 코드블록 제거용 헬퍼 함수
+fn parse_json_from_llm_response(raw_response: &str) -> String {
+    let trimmed = raw_response.trim();
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            return trimmed[start..=end].to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 // ============================================================================
@@ -48,20 +122,24 @@ async fn get_element_rect(
 // ============================================================================
 
 /// 브라우저 DOM에서 크롤링/스크래핑 관점에서 의미 있는 핵심 태그, id, class, 주요 속성만 남긴 간소화된 DOM 텍스트 트리를 추출합니다.
-pub async fn get_simplified_dom_tree(page: &Page) -> Result<String, Box<dyn Error>> {
+pub async fn get_simplified_dom_tree(page: &Page) -> Result<String, DynError> {
+    // DynError가 Box<dyn StdError + Send + Sync> 형태이므로,
+    // 해당 에러 타입이 std::error::Error를 구현하고 있다면 ? 연산자에 의해
+    // DynError로 자동 포장(From 변환)되어 상위 호출자로 즉시 반환됩니다.
     let js_script = r#"
     (() => {
         // 의미 있는 주요 태그 목록 (시각적/구조적 레이아웃 요소 위주)
         const SIGNIFICANT_TAGS = new Set([
-            'HEADER', 'NAV', 'MAIN', 'ARTICLE', 'SECTION', 'ASIDE', 'FOOTER',
-            'DIV', 'UL', 'OL', 'LI', 'TABLE', 'THEAD', 'TBODY', 'TR', 'TH', 'TD',
-            'A', 'BUTTON', 'FORM', 'INPUT', 'SELECT', 'TEXTAREA', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6'
+            'body', 'header', 'nav', 'main', 'article', 'section', 'aside', 'footer',
+            'div', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
+            'a', 'button', 'form', 'input', 'select', 'textarea', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'
         ]);
 
         function buildTree(node, depth = 0) {
             if (!node || node.nodeType !== Node.ELEMENT_NODE) return '';
 
-            const tagName = node.tagName.toUpperCase();
+            // 노드 태그명을 소문자로 변환하여 비교
+            const tagName = node.tagName.toLowerCase();
             if (!SIGNIFICANT_TAGS.has(tagName)) return '';
 
             // hidden 속성이거나 display:none인 노드는 건너뜁니다.
@@ -99,7 +177,7 @@ pub async fn get_simplified_dom_tree(page: &Page) -> Result<String, Box<dyn Erro
             }
 
             const textAttr = directText ? ` text="${directText}"` : '';
-            let result = `${indent}<${tagName.toLowerCase()}${attrStr}${textAttr}>\n`;
+            let result = `${indent}<${tagName}${attrStr}${textAttr}>\n`;
 
             for (const child of node.children) {
                 result += buildTree(child, depth + 1);
@@ -108,6 +186,7 @@ pub async fn get_simplified_dom_tree(page: &Page) -> Result<String, Box<dyn Erro
             return result;
         }
 
+        console.log('Starting buildTree with document.body');
         return buildTree(document.body || document.documentElement);
     })()
     "#;
@@ -125,7 +204,7 @@ pub async fn extract_selectors_via_local_llm(
     target_description: &str,
     ollama_endpoint: Option<&str>,
     model_name: Option<&str>,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<String, DynError> {
     // 1. 호스트/포트 설정 (인자 -> 환경변수 -> 기본값 순서로 결정)
     // OLLAMA_HOST 예시: "http://localhost:31434"
     let host_env = env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost".to_string());
@@ -183,7 +262,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[tokio::test]
-    async fn test_get_element_rect() -> Result<(), Box<dyn Error>> {
+    async fn test_get_simplify_dom() -> Result<(), DynError> {
         // 1. Cargo.toml이 위치한 프로젝트 루트 기준 상대 경로 설정
         let mut test_html_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         test_html_path.push("src/bin/scraper/lib/test.html");
@@ -194,6 +273,71 @@ mod tests {
                 test_html_path, e
             )
         })?;
+
+        // 2. Headless 브라우저 생성 및 실행
+        let (mut browser, mut handler) = Browser::launch(
+            BrowserConfig::builder()
+                .arg("--headless=new")
+                .arg("--no-sandbox")
+                .build()?,
+        )
+        .await?;
+
+        // 3. chromiumoxide 필수: 백그라운드 이벤트 처리 핸들러 태스크 루프
+        let handle = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if let Err(e) = event {
+                    // 경고/에러가 발생해도 백그라운드 루프를 깨뜨리지 않고 계속 진행
+                    // eprintln!("Chromium handler event error: {:?}", e);
+                }
+            }
+        });
+
+        let page = browser.new_page("about:blank").await?;
+
+        // 4. HTML 파일 내용을 직접 DOM에 삽입 (navigate 대신 set_content 사용)
+        page.set_content(&test_html_content).await?;
+
+        // 5. Simplified DOM tree를 얻어옵니다.
+        let simplified_dom_tree = get_simplified_dom_tree(&page).await?;
+
+        // 6. simplified 의 길이가 0이 아닌지 검사하고 0이면 테스트 실패 처리
+        assert!(
+            simplified_dom_tree.len() > 0,
+            "simplified_dom_tree is empty"
+        );
+
+        // 7. 원본과 simplified 결과의 길이를 비교합니다. 더 짧아져야 테스트 통과, 아니면 실패.
+        assert!(
+            simplified_dom_tree.len() <= test_html_content.len(),
+            "simplified_dom_tree is longer than test_html_content"
+        );
+
+        // 8. 브라우저 종료 및 핸들러 정리
+        browser.close().await?;
+        handle.abort();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_element() -> DynResult<()> {
+        // 1. Cargo.toml이 위치한 프로젝트 루트 기준 상대 경로 설정
+        // let mut test_html_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // test_html_path.push("src/bin/scraper/lib/test.html");
+
+        let test_html_content = r#"
+        <main class="container">
+            <article class="card">
+                <h2 class="title"><a href="/post/1">첫 번째 글 제목</a></h2>
+                <span class="author">작성자A</span>
+            </article>
+            <article class="card">
+                <h2 class="title"><a href="/post/2">두 번째 글 제목</a></h2>
+                <span class="author">작성자B</span>
+            </article>
+        </main>
+        "#;
 
         // 2. Headless 브라우저 생성 및 실행
         let (mut browser, mut handler) = Browser::launch(
@@ -223,13 +367,30 @@ mod tests {
         // 5. 메이슨리 그리드 내 첫 번째 href 보유 <a> 태그 지정
         // CSS Selector 방식: href가 존재하는 첫 번째 a 태그 선택
         let selector = "main a[href]";
-        let result = get_element_rect(&page, selector).await?;
+        let result = get_element_info(&page, selector).await?;
 
-        // 요소가 존재하고 Option 내부에 값이 있는지 검증
-        assert!(result.is_some(), "요소를 찾을 수 없습니다.");
+        // 1. 결과(Option) 검증
+        let info = result.expect("요소를 찾지 못했습니다 (Result::None)");
 
-        let rect = result.unwrap();
+        // 2. ExtractedElementInfo 내부 필드 검증
+        println!("선택자: {}", info.selector);
+
+        if let Some(text) = &info.text_content {
+            println!("추출된 텍스트: {text}");
+            assert!(!text.is_empty(), "텍스트 내용이 비어 있습니다.");
+        }
+
+        if let Some(html) = &info.outer_html {
+            println!("추출된 HTML: {html}");
+        }
+
+        // 3. Rect 좌표 검증
+        let rect = info.rect.expect("ElementRect 정보를 찾을 수 없습니다.");
         println!("추출된 좌표: {:?}", rect);
+
+        // 좌표값 유효성 단정 (예: 너비와 높이가 0보다 큰지)
+        assert!(rect.width > 0.0, "width가 0 이하입니다.");
+        assert!(rect.height > 0.0, "height가 0 이하입니다.");
 
         // 6. 브라우저 종료 및 핸들러 정리
         browser.close().await?;
@@ -239,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_extract_selectors_via_local_llm() -> Result<(), Box<dyn Error>> {
+    async fn test_extract_selectors_via_local_llm() -> crate::lib::dyn_result::DynResult<()> {
         // 테스트용 샘플 DOM 트리
         let sample_dom = r#"
         <main class="container">

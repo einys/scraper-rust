@@ -1,4 +1,4 @@
-lib.rs -> main import target
+lib.rs <<- main import target
 
 lib.rs가 그 이외의 이 폴더의 파일들을 pub mod 로 모집해야 함!
 
