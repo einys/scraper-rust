@@ -339,21 +339,18 @@ async fn main() -> DynResult<()> {
 
     // save selectors to file
     let mut file = tokio::fs::File::create("page_selectors.html").await?;
-    file.write_all(selectors.as_bytes()).await?;
+    file.write_all(selectors.to_string().as_bytes()).await?;
     file.flush().await?;
 
     println!("1. 원본 html_content 길이: {}", html_content.len());
     println!("2. simplified_dom 결과 길이: {}", simplified_dom.len());
 
-    // 원본 page 에서 selectors 에 해당하는 컨텐츠들만 남김
-    let selectors_json = lib::page::extract_data_with_selectors(&page, &selectors).await?;
+    // Step 2: 생성된 명세로 원본 HTML DOM 파싱 실행
+    let extracted_json = lib::page::parse_items_with_schema(&html_content, &selectors)?;
 
-    println!("Parsing Result: {}", selectors_json);
-
-    // save as a result json file
-    let mut file = tokio::fs::File::create("page_result.json").await?;
-    file.write_all(selectors_json.as_bytes()).await?;
-    file.flush().await?;
+    // tokio::fs::write를 사용해 한 줄로 저장
+    let json_string = serde_json::to_string_pretty(&extracted_json)?;
+    tokio::fs::write("page_result.json", json_string.as_bytes()).await?;
 
     // let prompt = format!(
     //     "다음 텍스트는 한 웹페이지 html의 정보를 파싱한 결과물이야.
@@ -363,19 +360,5 @@ async fn main() -> DynResult<()> {
 
     // let request = GenerationRequest::new(model, prompt);
 
-    // TODO: 여기서부터 새로 짜야됨 지금 꼬여있음
-
     Ok(())
-
-    // println!("\n--- 추출 결과 ---");
-    // match ollama.generate(request).await {
-    //     Ok(res) => {
-    //         println!("{}", res.response);
-    //     }
-    //     Err(e) => {
-    //         eprintln!("Ollama 호출 실패: {:?}", e);
-    //     }
-    // }
-
-    // Ok(())
 }

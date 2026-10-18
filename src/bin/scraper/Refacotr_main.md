@@ -1,4 +1,5 @@
 keywords: 'code review'
+created: '2026-10-15'
 ---
 
 포인트:

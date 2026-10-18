@@ -1,5 +1,7 @@
 use chromiumoxide::Page;
+use ollama_rs::generation::parameters::FormatType;
 use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
+use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -31,7 +33,7 @@ pub struct ExtractedElementInfo {
 pub struct ExtractionResult {
     pub data: HashMap<String, ExtractedElementInfo>,
 }
-use serde_json::Value;
+use serde_json::{json, Value};
 
 // selector 받고 -> 내용, 원본, x y 좌표 담긴 구조체 리턴
 pub async fn get_element_info(
@@ -195,7 +197,103 @@ pub async fn get_simplified_dom_tree(page: &Page) -> Result<String, DynError> {
     Ok(tree)
 }
 
-use std::env;
+use std::{env, fmt};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorSchema {
+    pub container: String,
+    pub fields: HashMap<String, String>,
+}
+
+impl fmt::Display for SelectorSchema {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // JSON 문자열로 직렬화하여 Display에 전달
+        match serde_json::to_string_pretty(self) {
+            Ok(json_str) => write!(f, "{}", json_str),
+            Err(_) => Err(fmt::Error),
+        }
+    }
+}
+
+// 3. SelectorSchema를 이용해 HTML 파싱 및 JSON Value로 반환하는 함수
+pub fn parse_items_with_schema(raw_html: &str, schema: &SelectorSchema) -> Result<Value, DynError> {
+    let document = Html::parse_document(raw_html);
+
+    let container_selector = Selector::parse(&schema.container)
+        .map_err(|e| format!("Invalid container selector '{}': {:?}", schema.container, e))?;
+
+    let mut field_selectors: HashMap<String, Selector> = HashMap::new();
+    for (field_name, selector_str) in &schema.fields {
+        if let Ok(sel) = Selector::parse(selector_str) {
+            field_selectors.insert(field_name.clone(), sel);
+        } else {
+            eprintln!(
+                "⚠️ Warning: Failed to parse selector '{}' for field '{}'",
+                selector_str, field_name
+            );
+        }
+    }
+
+    let mut results = Vec::new();
+
+    for container_el in document.select(&container_selector) {
+        let mut item_data = HashMap::new();
+
+        for (field_name, selector) in &field_selectors {
+            if let Some(target_el) = container_el.select(selector).next() {
+                let value = extract_value_by_field_name(field_name, &target_el);
+                item_data.insert(field_name.clone(), value);
+            } else {
+                item_data.insert(field_name.clone(), String::new());
+            }
+        }
+
+        results.push(item_data);
+    }
+
+    // 결과를 serde_json::Value 형태로 변환
+    Ok(json!(results))
+}
+
+fn extract_value_by_field_name(field_name: &str, element: &ElementRef) -> String {
+    let name_lower = field_name.to_lowercase();
+
+    if name_lower.contains("href") || name_lower.contains("link") {
+        element
+            .value()
+            .attr("href")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                element
+                    .text()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .trim()
+                    .to_string()
+            })
+    } else if name_lower.contains("src") || name_lower.contains("img") {
+        element
+            .value()
+            .attr("src")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                element
+                    .text()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .trim()
+                    .to_string()
+            })
+    } else {
+        element
+            .text()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
 
 /// 간소화된 DOM 트리를 로컬 LLM(Ollama)에 전달하여
 /// 타깃 목적(target_description)에 적합한 CSS Selector 목록이나 JSON 결과를 얻어옵니다.
@@ -204,7 +302,13 @@ pub async fn extract_selectors_via_local_llm(
     target_description: &str,
     ollama_endpoint: Option<&str>,
     model_name: Option<&str>,
-) -> Result<String, DynError> {
+) -> Result<SelectorSchema, DynError> {
+    // simplified_dom length logging
+    println!(
+        "🪐 LLM Loading... feed: simplified_dom, length: {}",
+        simplified_dom.len()
+    );
+
     // 1. 호스트/포트 설정 (인자 -> 환경변수 -> 기본값 순서로 결정)
     // OLLAMA_HOST 예시: "http://localhost:31434"
     let host_env = env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost".to_string());
@@ -238,17 +342,65 @@ pub async fn extract_selectors_via_local_llm(
         ---
         {}
         ---
-        Task: Find the best CSS Selectors for the following request: "{}"
-        Output format: Provide a concise JSON object containing field names and their corresponding CSS selectors without any unnecessary explanation."#,
+        Task: Find the CSS Selectors to extract a list of items for: "{}"
+        Output format: Provide a concise JSON object containing:
+        - "container": CSS selector for the repeating item wrapper/card element.
+        - "fields": JSON object mapping field names to their relative CSS selectors inside the container.
+        Provide ONLY valid JSON."#,
         simplified_dom.trim(),
         target_description.trim()
     );
 
-    // 4. Ollama 요청 및 응답 반환
-    let request = GenerationRequest::new(model, prompt);
-    let ollama_response = ollama.generate(request).await?;
+    // 4. Ollama 요청 및 파싱 (최대 3회 재시도)
+    let max_retries = 3;
+    let mut last_error: Option<DynError> = None;
 
-    Ok(ollama_response.response)
+    for attempt in 1..=max_retries {
+        println!("Attempt {}/{} requesting LLM...", attempt, max_retries);
+
+        // JSON 응답 포맷 강제
+        let request =
+            GenerationRequest::new(model.clone(), prompt.clone()).format(FormatType::Json);
+
+        match ollama.generate(request).await {
+            Ok(ollama_response) => {
+                let raw_json = ollama_response.response.trim();
+
+                // Markdown code block이 섞여 들어오는 경우 정제처리
+                let cleaned_json = raw_json
+                    .strip_prefix("```json")
+                    .or_else(|| raw_json.strip_prefix("```"))
+                    .unwrap_or(raw_json)
+                    .strip_suffix("```")
+                    .unwrap_or(raw_json)
+                    .trim();
+
+                match serde_json::from_str::<SelectorSchema>(cleaned_json) {
+                    Ok(parsed_schema) => {
+                        println!("Successfully parsed SelectorSchema!");
+                        return Ok(parsed_schema);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to parse JSON response on attempt {}: {}",
+                            attempt, e
+                        );
+                        eprintln!("Raw LLM Output was: {}", raw_json);
+                        last_error = Some(Box::new(e));
+                    }
+                }
+            }
+            Ok(res) if res.response.is_empty() => {
+                eprintln!("Received empty response on attempt {}", attempt);
+            }
+            Err(e) => {
+                eprintln!("Ollama API call failed on attempt {}: {}", attempt, e);
+                last_error = Some(Box::new(e));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "Failed to extract valid selectors after retries".into()))
 }
 
 #[cfg(test)]
@@ -418,13 +570,15 @@ mod tests {
         let target_description = "게시글 목록의 링크(href)와 제목(title), 작성자(author) 추출";
 
         // 로컬 LLM 함수 호출
-        let response_string = extract_selectors_via_local_llm(
+        let response_schema = extract_selectors_via_local_llm(
             sample_dom,
             target_description,
             None, // 기본 오버라이드 엔드포인트 사용 안 함 (환경변수/기본값 31434 사용)
             None, // 기본 모델 사용 (qwen2.5:14b)
         )
         .await?;
+
+        let response_string = response_schema.to_string();
 
         println!("=== LLM Raw Response ===");
         println!("{}", response_string);
