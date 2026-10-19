@@ -1,10 +1,10 @@
 {
-  "container": ".relative.group.w-full",
+  "container": ".thumbnail-wrapper",
   "fields": {
-    "username": ".flex.items-center.gap-1.px-3.pt-3 > .relative > .relative > .relative > .inline-flex.gap-1 > .relative > a",
-    "img_src": ".thumbnail-wrapper > img",
-    "text": "article > .flex.items-center.gap-1.px-3.pt-3 ~ .px-3.pb-3",
-    "href": ".relative.group.w-full > a.cursor-pointer",
-    "link": ".flex.items-center.gap-1.px-3.pt-3 > .relative > .relative > .relative > .inline-flex.gap-1 > .relative > a"
+    "href": ".thumbnail-wrapper .cursor-pointer",
+    "img_src": ".thumbnail-wrapper .rounded-2xl img",
+    "link": ".thumbnail-wrapper a",
+    "username": ".flex.items-center.gap-1.px-3.pt-3 > span",
+    "text": ".px-3.pb-3 :not(.h-40) :not(:has(.h-40 *))"
   }
 }
