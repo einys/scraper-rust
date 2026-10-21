@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod cdp_controller;
 pub mod dom_mapper;
 pub mod dyn_result;

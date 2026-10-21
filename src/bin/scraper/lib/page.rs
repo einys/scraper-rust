@@ -1,15 +1,12 @@
-use chromiumoxide::Page;
 use ollama_rs::generation::parameters::FormatType;
 use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::error::Error;
-use tokio::test;
 
 use crate::lib::dyn_result::DynError;
-use crate::lib::dyn_result::DynResult;
+use crate::PageTrait;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElementRect {
@@ -35,9 +32,27 @@ pub struct ExtractionResult {
 }
 use serde_json::{json, Value};
 
+use std::{env, fmt};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorSchema {
+    pub container: String,
+    pub fields: HashMap<String, String>,
+}
+
+impl fmt::Display for SelectorSchema {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // JSON 문자열로 직렬화하여 Display에 전달
+        match serde_json::to_string_pretty(self) {
+            Ok(json_str) => write!(f, "{}", json_str),
+            Err(_) => Err(fmt::Error),
+        }
+    }
+}
+
 // selector 받고 -> 내용, 원본, x y 좌표 담긴 구조체 리턴
-pub async fn get_element_info(
-    page: &chromiumoxide::Page,
+pub async fn get_element_info<P: PageTrait>(
+    page: &P,
     selector: &str,
 ) -> Result<Option<ExtractedElementInfo>, DynError> {
     // JS 문자열 이스케이프 및 안전성을 위해 JSON.stringify 사용
@@ -65,39 +80,54 @@ pub async fn get_element_info(
     );
 
     // null인 경우 deserialization 에러를 피하고 Option<ExtractedElementInfo>로 매핑
-    let result: Option<ExtractedElementInfo> = page.evaluate(js_script).await?.into_value()?;
+    // null인 경우 deserialization 에러를 피하고 Option<ExtractedElementInfo>로 매핑
+    let result: Option<ExtractedElementInfo> = match page.evaluate(&js_script).await {
+        Ok(result_str) => {
+            if result_str == "null" {
+                None
+            } else {
+                Some(serde_json::from_str(&result_str)?)
+            }
+        }
+        Err(e) => {
+            eprintln!("Evaluation 오류: {}", e);
+            None
+        }
+    };
     Ok(result)
 }
 
 /// 리턴: json형식의 '문자열'. LLM Selector 결과와 브라우저 Page를 받아 위치 및 내용이 통합된 JSON 결과를 반환합니다.
-pub async fn extract_data_with_selectors(
-    page: &chromiumoxide::Page,
-    llm_selector_json_str: &str,
+pub async fn extract_data_with_selectors<P: PageTrait>(
+    page: &P,
+    schema: &SelectorSchema,
 ) -> Result<String, DynError> {
     // LLM 결과에서 JSON 부분 추출 (마크다운 ```json ... ``` 응답 대응)
-    let clean_json_str = parse_json_from_llm_response(llm_selector_json_str);
-
-    // Dynamic JSON 파싱 (필드명 -> Selector 문자열)
-    let selectors_map: HashMap<String, Value> = serde_json::from_str(&clean_json_str)?;
+    // let clean_json_str = parse_json_from_llm_response(llm_selector_json_str);
+    // 💡 문자열 파싱 과정(parse_json_from_llm_response)이 제거되고
+    //    타입이 보장된 schema 구조체를 직접 활용합니다.
     let mut final_data: HashMap<String, ExtractedElementInfo> = HashMap::new();
+    for (field_name, selector) in &schema.fields {
+        // 컨테이너 셀렉터와 필드 상대 셀렉터를 결합하거나 단독 셀렉터로 정보 추출
+        let full_selector = if schema.container.trim().is_empty() {
+            selector.clone()
+        } else {
+            format!("{} {}", schema.container, selector)
+        };
 
-    for (field_name, selector_val) in selectors_map {
-        if let Some(selector) = selector_val.as_str() {
-            // 위치와 내용 원본을 한 번의 JS call로 취득
-            if let Ok(Some(element_info)) = get_element_info(page, selector).await {
-                final_data.insert(field_name, element_info);
-            } else {
-                // 요소를 찾지 못했거나 에러인 경우 None으로 채워 반환 구조 유지
-                final_data.insert(
-                    field_name,
-                    ExtractedElementInfo {
-                        selector: selector.to_string(),
-                        text_content: None,
-                        outer_html: None,
-                        rect: None,
-                    },
-                );
-            }
+        if let Ok(Some(element_info)) = get_element_info(page, &full_selector).await {
+            final_data.insert(field_name.clone(), element_info);
+        } else {
+            // 요소를 찾지 못했거나 에러인 경우 None 구조 유지
+            final_data.insert(
+                field_name.clone(),
+                ExtractedElementInfo {
+                    selector: full_selector,
+                    text_content: None,
+                    outer_html: None,
+                    rect: None,
+                },
+            );
         }
     }
 
@@ -109,7 +139,7 @@ pub async fn extract_data_with_selectors(
 }
 
 /// LLM 응답에 섞인 마크다운 코드블록 제거용 헬퍼 함수
-fn parse_json_from_llm_response(raw_response: &str) -> String {
+pub fn parse_json_from_llm_response(raw_response: &str) -> String {
     let trimmed = raw_response.trim();
     if let Some(start) = trimmed.find('{') {
         if let Some(end) = trimmed.rfind('}') {
@@ -124,95 +154,97 @@ fn parse_json_from_llm_response(raw_response: &str) -> String {
 // ============================================================================
 
 /// 브라우저 DOM에서 크롤링/스크래핑 관점에서 의미 있는 핵심 태그, id, class, 주요 속성만 남긴 간소화된 DOM 텍스트 트리를 추출합니다.
-pub async fn get_simplified_dom_tree(page: &Page) -> Result<String, DynError> {
+pub async fn get_simplified_dom_tree<P: PageTrait>(page: &P) -> Result<String, DynError> {
     // DynError가 Box<dyn StdError + Send + Sync> 형태이므로,
     // 해당 에러 타입이 std::error::Error를 구현하고 있다면 ? 연산자에 의해
     // DynError로 자동 포장(From 변환)되어 상위 호출자로 즉시 반환됩니다.
     let js_script = r#"
-    (() => {
-        // 의미 있는 주요 태그 목록 (시각적/구조적 레이아웃 요소 위주)
-        const SIGNIFICANT_TAGS = new Set([
-            'body', 'header', 'nav', 'main', 'article', 'section', 'aside', 'footer',
-            'div', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
-            'a', 'button', 'form', 'input', 'select', 'textarea', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'
-        ]);
+        (() => {
+            const SIGNIFICANT_TAGS = new Set([
+                'body', 'header', 'nav', 'main', 'article', 'section', 'aside', 'footer',
+                'div', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'img', 'span',
+                'a', 'button', 'form', 'input', 'select', 'textarea', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'
+            ]);
 
-        function buildTree(node, depth = 0) {
-            if (!node || node.nodeType !== Node.ELEMENT_NODE) return '';
+            // 반복 자식 요소 최대 제한 개수
+            const MAX_REPEATED_CHILDREN = 3;
 
-            // 노드 태그명을 소문자로 변환하여 비교
-            const tagName = node.tagName.toLowerCase();
-            if (!SIGNIFICANT_TAGS.has(tagName)) return '';
+            function buildTree(node, depth = 0) {
+                if (!node || node.nodeType !== Node.ELEMENT_NODE) return '';
 
-            // hidden 속성이거나 display:none인 노드는 건너뜁니다.
-            const style = window.getComputedStyle(node);
-            if (style.display === 'none' || style.visibility === 'hidden') return '';
+                const tagName = node.tagName.toLowerCase();
+                if (!SIGNIFICANT_TAGS.has(tagName)) return '';
 
-            const indent = '  '.repeat(depth);
-            let attrStr = '';
+                const style = window.getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden') return '';
 
-            if (node.id) {
-                attrStr += ` id="${node.id}"`;
-            }
-            if (node.className && typeof node.className === 'string' && node.className.trim() !== '') {
-                // 클래스가 너무 길 경우 대표적인 클래스 위주로 정리
-                const classes = node.className.trim().split(/\s+/).slice(0, 5).join(' ');
-                attrStr += ` class="${classes}"`;
-            }
-            if (node.hasAttribute('href')) {
-                attrStr += ` href="${node.getAttribute('href')}"`;
-            }
-            if (node.hasAttribute('name')) {
-                attrStr += ` name="${node.getAttribute('name')}"`;
-            }
+                const indent = '  '.repeat(depth);
+                let attrStr = '';
 
-            // 텍스트 노드가 직계 자식으로 포함되어 있다면 간략하게 요약 추가 (최대 30자)
-            let directText = '';
-            for (const child of node.childNodes) {
-                if (child.nodeType === Node.TEXT_NODE) {
-                    const text = child.textContent.trim();
-                    if (text.length > 0) {
-                        directText = text.length > 30 ? text.substring(0, 30) + '...' : text;
-                        break;
+                if (node.id) {
+                    attrStr += ` id="${node.id}"`;
+                }
+                if (node.className && typeof node.className === 'string' && node.className.trim() !== '') {
+                    // Tailwind/유틸리티 클래스 유지를 위해 최대 3개 클래스로 제한
+                    const classes = node.className.trim().split(/\s+/).slice(0, 3).join(' ');
+                    attrStr += ` class="${classes}"`;
+                }
+                if (node.hasAttribute('href')) {
+                    attrStr += ` href="${node.getAttribute('href')}"`;
+                }
+                if (node.hasAttribute('name')) {
+                    attrStr += ` name="${node.getAttribute('name')}"`;
+                }
+
+                let directText = '';
+                for (const child of node.childNodes) {
+                    if (child.nodeType === Node.TEXT_NODE) {
+                        const text = child.textContent.trim();
+                        if (text.length > 0) {
+                            directText = text.length > 25 ? text.substring(0, 25) + '...' : text;
+                            break;
+                        }
                     }
                 }
+
+                const textAttr = directText ? ` text="${directText}"` : '';
+                let result = `${indent}<${tagName}${attrStr}${textAttr}>\n`;
+
+                // 🔥 핵심: 자식 노드들의 "태그명+클래스명" 조합으로 그룹핑하여 무한 반복을 3개로 자름
+                const childCounts = new Map();
+                let truncatedCount = 0;
+
+                for (const child of node.children) {
+                    const childTag = child.tagName.toLowerCase();
+                    const childClass = (child.className && typeof child.className === 'string')
+                        ? child.className.trim().split(/\s+/)[0] || ''
+                        : '';
+                    const key = `${childTag}.${childClass}`;
+
+                    const currentCount = childCounts.get(key) || 0;
+                    if (currentCount >= MAX_REPEATED_CHILDREN) {
+                        truncatedCount++;
+                        continue; // 3개가 넘어가면 생략
+                    }
+
+                    childCounts.set(key, currentCount + 1);
+                    result += buildTree(child, depth + 1);
+                }
+
+                // 축약된 요소가 있다면 LLM에게 생략되었음을 명시
+                if (truncatedCount > 0) {
+                    result += `${indent}  <!-- ... [${truncatedCount} similar items truncated] ... -->\n`;
+                }
+
+                return result;
             }
 
-            const textAttr = directText ? ` text="${directText}"` : '';
-            let result = `${indent}<${tagName}${attrStr}${textAttr}>\n`;
+            return buildTree(document.body || document.documentElement);
+        })()
+        "#;
 
-            for (const child of node.children) {
-                result += buildTree(child, depth + 1);
-            }
-
-            return result;
-        }
-
-        console.log('Starting buildTree with document.body');
-        return buildTree(document.body || document.documentElement);
-    })()
-    "#;
-
-    let tree: String = page.evaluate(js_script).await?.into_value()?;
+    let tree: String = page.evaluate(js_script).await?;
     Ok(tree)
-}
-
-use std::{env, fmt};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SelectorSchema {
-    pub container: String,
-    pub fields: HashMap<String, String>,
-}
-
-impl fmt::Display for SelectorSchema {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // JSON 문자열로 직렬화하여 Display에 전달
-        match serde_json::to_string_pretty(self) {
-            Ok(json_str) => write!(f, "{}", json_str),
-            Err(_) => Err(fmt::Error),
-        }
-    }
 }
 
 // 3. SelectorSchema를 이용해 HTML 파싱 및 JSON Value로 반환하는 함수
@@ -259,31 +291,42 @@ fn extract_value_by_field_name(field_name: &str, element: &ElementRef) -> String
     let name_lower = field_name.to_lowercase();
 
     if name_lower.contains("href") || name_lower.contains("link") {
+        // 1. 현재 요소(또는 선택된 요소) 자체가 href 속성을 가지고 있는 경우
+        if let Some(href) = element.value().attr("href") {
+            return href.to_string();
+        }
+        // 2. 혹시 자식 노드 중에 a 태그가 따로 존재하는 경우
+        if let Ok(a_sel) = scraper::Selector::parse("a") {
+            if let Some(a_el) = element.select(&a_sel).next() {
+                if let Some(href) = a_el.value().attr("href") {
+                    return href.to_string();
+                }
+            }
+        }
+        // Fallback: 텍스트 수집
         element
-            .value()
-            .attr("href")
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                element
-                    .text()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .trim()
-                    .to_string()
-            })
+            .text()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string()
     } else if name_lower.contains("src") || name_lower.contains("img") {
+        if let Some(src) = element.value().attr("src") {
+            return src.to_string();
+        }
+        if let Ok(img_sel) = scraper::Selector::parse("img") {
+            if let Some(img_el) = element.select(&img_sel).next() {
+                if let Some(src) = img_el.value().attr("src") {
+                    return src.to_string();
+                }
+            }
+        }
         element
-            .value()
-            .attr("src")
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                element
-                    .text()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .trim()
-                    .to_string()
-            })
+            .text()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string()
     } else {
         element
             .text()
@@ -338,15 +381,15 @@ pub async fn extract_selectors_via_local_llm(
 
     // 3. Prompt 구성 (전달받은 매개변수 바인딩)
     let prompt = format!(
-        r#"Below is a simplified HTML DOM tree:
+        r#"Below is a simplified, REPRESENTATIVE HTML DOM tree:
         ---
         {}
         ---
         Task: Find the CSS Selectors to extract a list of items for: "{}"
         Output format: Provide a concise JSON object containing:
-        - "container": CSS selector for the repeating item wrapper/card element.
+        - "container": "topmost card wrapper selector",
         - "fields": JSON object mapping field names to their relative CSS selectors inside the container.
-        Provide ONLY valid JSON."#,
+        IMPORTANT RULES: Output MUST be the SIMPLEST, SHORTEST, standard CSS selectors ONLY. Provide ONLY valid JSON."#,
         simplified_dom.trim(),
         target_description.trim()
     );
@@ -390,9 +433,7 @@ pub async fn extract_selectors_via_local_llm(
                     }
                 }
             }
-            Ok(res) if res.response.is_empty() => {
-                eprintln!("Received empty response on attempt {}", attempt);
-            }
+
             Err(e) => {
                 eprintln!("Ollama API call failed on attempt {}: {}", attempt, e);
                 last_error = Some(Box::new(e));
@@ -405,11 +446,13 @@ pub async fn extract_selectors_via_local_llm(
 
 #[cfg(test)]
 mod tests {
+    use crate::lib::dyn_result::DynResult;
+    use crate::ChromiumPageAdapter;
+
     use super::*;
 
     use chromiumoxide::browser::{Browser, BrowserConfig};
     use futures::StreamExt;
-    use std::error::Error;
     use std::fs::read_to_string;
     use std::path::PathBuf;
 
@@ -450,8 +493,10 @@ mod tests {
         // 4. HTML 파일 내용을 직접 DOM에 삽입 (navigate 대신 set_content 사용)
         page.set_content(&test_html_content).await?;
 
+        // 어댑터로 감싸기
+        let page_adapter = ChromiumPageAdapter { page: page };
         // 5. Simplified DOM tree를 얻어옵니다.
-        let simplified_dom_tree = get_simplified_dom_tree(&page).await?;
+        let simplified_dom_tree = get_simplified_dom_tree(&page_adapter).await?;
 
         // 6. simplified 의 길이가 0이 아닌지 검사하고 0이면 테스트 실패 처리
         assert!(
@@ -514,12 +559,12 @@ mod tests {
 
         // 4. HTML 파일 내용을 직접 DOM에 삽입 (navigate 대신 set_content 사용)
         page.set_content(test_html_content).await?;
-
+        let page_adaptor = ChromiumPageAdapter { page: page };
         // 5. async 함수 내부이므로 block_on 없이 await 직접 사용
         // 5. 메이슨리 그리드 내 첫 번째 href 보유 <a> 태그 지정
         // CSS Selector 방식: href가 존재하는 첫 번째 a 태그 선택
         let selector = "main a[href]";
-        let result = get_element_info(&page, selector).await?;
+        let result = get_element_info(&page_adaptor, selector).await?;
 
         // 1. 결과(Option) 검증
         let info = result.expect("요소를 찾지 못했습니다 (Result::None)");
