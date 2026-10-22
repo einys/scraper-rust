@@ -550,3 +550,35 @@ Step 1: Reasoning: I need to scroll down to see more items. => Action: ScrollPag
 Step 2: Reasoning: Now click the 'Load More' button. => Action: ClickElement { reasoning: "...", selector: "#more_btn" }
 
 ```
+
+---
+
+# 에이전트가 파일을 용도에 맞게 구분하게 하는 법
+
+1. 에이전트가 파일의 용도를 구분하게 만드는 법
+
+에이전트에게 파일 목록과 용도를 프롬프트(System Prompt)를 통해 도구 사용 규칙(Tool Contract)으로 명확히 알려주면 됩니다.
+Rust
+
+```
+// AgentAction enum 정의에 ReadFile 추가
+pub enum AgentAction {
+    // ... 기존 액션들 ...
+    ReadFile {
+        reasoning: String,
+        filename: String, // 예: "selectors.json" 또는 "items.json"
+    },
+}
+
+시스템 프롬프트 지침 예시:
+
+        selectors.json: 이전에 성공했던 CSS 셀렉터 스키마가 저장된 파일. 셀렉터 재활용 시 읽기.
+
+        items.json: 지금까지 스크랩하여 저장된 데이터 목록 파일.
+```
+
+---
+
+# Output 을 json으로 구조화 형식화 하는 법
+
+---

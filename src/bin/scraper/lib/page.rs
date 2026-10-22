@@ -80,7 +80,6 @@ pub async fn get_element_info<P: PageTrait>(
     );
 
     // null인 경우 deserialization 에러를 피하고 Option<ExtractedElementInfo>로 매핑
-    // null인 경우 deserialization 에러를 피하고 Option<ExtractedElementInfo>로 매핑
     let result: Option<ExtractedElementInfo> = match page.evaluate(&js_script).await {
         Ok(result_str) => {
             if result_str == "null" {
@@ -90,7 +89,7 @@ pub async fn get_element_info<P: PageTrait>(
             }
         }
         Err(e) => {
-            eprintln!("Evaluation 오류: {}", e);
+            eprintln!("Evaluation 오류: {} of selector_json: {}", e, selector_json);
             None
         }
     };
@@ -338,112 +337,6 @@ fn extract_value_by_field_name(field_name: &str, element: &ElementRef) -> String
     }
 }
 
-/// 간소화된 DOM 트리를 로컬 LLM(Ollama)에 전달하여
-/// 타깃 목적(target_description)에 적합한 CSS Selector 목록이나 JSON 결과를 얻어옵니다.
-pub async fn extract_selectors_via_local_llm(
-    simplified_dom: &str,
-    target_description: &str,
-    ollama_endpoint: Option<&str>,
-    model_name: Option<&str>,
-) -> Result<SelectorSchema, DynError> {
-    // simplified_dom length logging
-    println!(
-        "🪐 LLM Loading... feed: simplified_dom, length: {}",
-        simplified_dom.len()
-    );
-
-    // 1. 호스트/포트 설정 (인자 -> 환경변수 -> 기본값 순서로 결정)
-    // OLLAMA_HOST 예시: "http://localhost:31434"
-    let host_env = env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost".to_string());
-    let port_env = env::var("OLLAMA_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(31434);
-
-    let (host, port) = if let Some(endpoint) = ollama_endpoint {
-        // ollama_endpoint가 직접 들어온 경우 간단한 파싱 (기본 URL 형태 가정)
-        let url = reqwest::Url::parse(endpoint)?;
-        let host_str = format!(
-            "{}://{}",
-            url.scheme(),
-            url.host_str().unwrap_or("localhost")
-        );
-        (host_str, url.port().unwrap_or(31434))
-    } else {
-        (host_env, port_env)
-    };
-
-    let ollama = Ollama::builder().host(host).port(port).build();
-
-    // 2. 모델명 설정 (인자 -> 환경변수 -> 기본값)
-    let default_model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:14b".to_string());
-    let model = model_name.unwrap_or(&default_model).to_string();
-
-    // 3. Prompt 구성 (전달받은 매개변수 바인딩)
-    let prompt = format!(
-        r#"Below is a simplified, REPRESENTATIVE HTML DOM tree:
-        ---
-        {}
-        ---
-        Task: Find the CSS Selectors to extract a list of items for: "{}"
-        Output format: Provide a concise JSON object containing:
-        - "container": "topmost card wrapper selector",
-        - "fields": JSON object mapping field names to their relative CSS selectors inside the container.
-        IMPORTANT RULES: Output MUST be the SIMPLEST, SHORTEST, standard CSS selectors ONLY. Provide ONLY valid JSON."#,
-        simplified_dom.trim(),
-        target_description.trim()
-    );
-
-    // 4. Ollama 요청 및 파싱 (최대 3회 재시도)
-    let max_retries = 3;
-    let mut last_error: Option<DynError> = None;
-
-    for attempt in 1..=max_retries {
-        println!("Attempt {}/{} requesting LLM...", attempt, max_retries);
-
-        // JSON 응답 포맷 강제
-        let request =
-            GenerationRequest::new(model.clone(), prompt.clone()).format(FormatType::Json);
-
-        match ollama.generate(request).await {
-            Ok(ollama_response) => {
-                let raw_json = ollama_response.response.trim();
-
-                // Markdown code block이 섞여 들어오는 경우 정제처리
-                let cleaned_json = raw_json
-                    .strip_prefix("```json")
-                    .or_else(|| raw_json.strip_prefix("```"))
-                    .unwrap_or(raw_json)
-                    .strip_suffix("```")
-                    .unwrap_or(raw_json)
-                    .trim();
-
-                match serde_json::from_str::<SelectorSchema>(cleaned_json) {
-                    Ok(parsed_schema) => {
-                        println!("Successfully parsed SelectorSchema!");
-                        return Ok(parsed_schema);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Failed to parse JSON response on attempt {}: {}",
-                            attempt, e
-                        );
-                        eprintln!("Raw LLM Output was: {}", raw_json);
-                        last_error = Some(Box::new(e));
-                    }
-                }
-            }
-
-            Err(e) => {
-                eprintln!("Ollama API call failed on attempt {}: {}", attempt, e);
-                last_error = Some(Box::new(e));
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| "Failed to extract valid selectors after retries".into()))
-}
-
 #[cfg(test)]
 mod tests {
     use crate::lib::dyn_result::DynResult;
@@ -592,62 +485,6 @@ mod tests {
         // 6. 브라우저 종료 및 핸들러 정리
         browser.close().await?;
         handle.abort();
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_extract_selectors_via_local_llm() -> crate::lib::dyn_result::DynResult<()> {
-        // 테스트용 샘플 DOM 트리
-        let sample_dom = r#"
-        <main class="container">
-            <article class="card">
-                <h2 class="title"><a href="/post/1">첫 번째 글 제목</a></h2>
-                <span class="author">작성자A</span>
-            </article>
-            <article class="card">
-                <h2 class="title"><a href="/post/2">두 번째 글 제목</a></h2>
-                <span class="author">작성자B</span>
-            </article>
-        </main>
-        "#;
-
-        let target_description = "게시글 목록의 링크(href)와 제목(title), 작성자(author) 추출";
-
-        // 로컬 LLM 함수 호출
-        let response_schema = extract_selectors_via_local_llm(
-            sample_dom,
-            target_description,
-            None, // 기본 오버라이드 엔드포인트 사용 안 함 (환경변수/기본값 31434 사용)
-            None, // 기본 모델 사용 (qwen2.5:14b)
-        )
-        .await?;
-
-        let response_string = response_schema.to_string();
-
-        println!("=== LLM Raw Response ===");
-        println!("{}", response_string);
-
-        // 응답 텍스트가 JSON 형태인지 검증
-        // (LLM이 마크다운 ```json ... ```으로 감싸서 응답하는 경우를 대비해 전처리 후 파싱해볼 수 있습니다)
-        let cleaned_json_str = response_string
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-
-        let parsed_json: Result<serde_json::Value, _> = serde_json::from_str(cleaned_json_str);
-
-        assert!(
-            parsed_json.is_ok(),
-            "LLM 응답이 올바른 JSON 형식이 아닙니다: {}",
-            response_string
-        );
-
-        let json_val = parsed_json?;
-        println!("=== Parsed JSON Object ===");
-        println!("{:#?}", json_val);
 
         Ok(())
     }

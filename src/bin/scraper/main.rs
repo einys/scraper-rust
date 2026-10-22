@@ -32,14 +32,6 @@ pub trait ElementTrait: Send + Sync {
     async fn click(&self) -> DynResult<()>;
 }
 
-// 3. PageTrait 선언
-#[async_trait]
-pub trait PageTrait: Send + Sync {
-    async fn evaluate(&self, script: &str) -> DynResult<(String)>;
-    async fn find_element(&self, selector: &str) -> DynResult<Box<dyn ElementTrait>>;
-    async fn content(&self) -> DynResult<String>;
-}
-
 // 4. ElementTrait 구현
 pub struct ChromiumElementAdapter {
     pub element: chromiumoxide::Element,
@@ -53,6 +45,14 @@ impl ElementTrait for ChromiumElementAdapter {
     }
 }
 
+// 3. PageTrait 선언
+#[async_trait]
+pub trait PageTrait: Send + Sync {
+    async fn evaluate(&self, script: &str) -> DynResult<(String)>;
+    async fn find_element(&self, selector: &str) -> DynResult<Box<dyn ElementTrait>>;
+    async fn content(&self) -> DynResult<String>;
+    async fn go_back(&self) -> DynResult<()>;
+}
 // 5. PageTrait 구현
 pub struct ChromiumPageAdapter {
     pub page: chromiumoxide::Page,
@@ -68,11 +68,17 @@ impl ChromiumPageAdapter {
 #[async_trait]
 impl PageTrait for ChromiumPageAdapter {
     async fn evaluate(&self, script: &str) -> DynResult<String> {
-        // chromiumoxide의 EvaluationResult에서 String으로 파싱
         let eval_res = self.page.evaluate(script).await.map_err(Box::new)?;
-        let result_str: String = eval_res.into_value::<String>().map_err(Box::new)?;
 
-        Ok(result_str)
+        // 💡 Value 타입으로 안전하게 받기
+        let val: serde_json::Value = eval_res.into_value().map_err(Box::new)?;
+
+        // 리턴값이 String이면 그대로 내보내고, Object/Array 등이면 JSON 문자열로 변환
+        if let Some(s) = val.as_str() {
+            Ok(s.to_string())
+        } else {
+            Ok(val.to_string())
+        }
     }
 
     async fn find_element(&self, selector: &str) -> DynResult<Box<dyn ElementTrait>> {
@@ -85,6 +91,11 @@ impl PageTrait for ChromiumPageAdapter {
     async fn content(&self) -> DynResult<String> {
         let html = self.page.content().await?;
         Ok(html)
+    }
+
+    async fn go_back(&self) -> DynResult<()> {
+        self.page.evaluate("window.history.back();").await?;
+        Ok(())
     }
 }
 
@@ -190,17 +201,21 @@ async fn main() -> DynResult<()> {
     let page_adapter = ChromiumPageAdapter { page: page };
 
     let target_description = r#"
-        Important Prompt: From the list of items, extract exactly these fields: content(item 상세 내용, description), username, href(item link), img_src"#;
+        Important Prompt: From the list of items, extract exactly these fields: content(item 상세 내용, description), username, img_src, links_attached"#;
 
+    // Goal prompt
     // mut 키워드 사용
     let mut agent = WebAgent::new(
         "http://localhost",
         31434,
         "qwen3:14b",
         &page_adapter,
-        "collect 50 items and details",
-        "From the list of items, extract: content, username, href, img_src",
+        "collect 50 items and details. Write extracted data(incl. selectors of pages) in file. Reuse selectors for same route. Navigate into each item's detail page (`/i/[id]`) to gather complete outer links and content.",
+        "From the list of items, extract: content, username, links, img_src",
     );
+
+    let file_prompt =
+        
 
     // 실행
     agent.run().await?;

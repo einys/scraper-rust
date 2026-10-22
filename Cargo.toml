@@ -16,3 +16,4 @@ anyhow = "1.0.104"
 scraper = "0.27.0"
 async-trait = "0.1.92"
 env = "1.0.1"
+schemars = "0.8"                                      # Enum/Struct 기반 JSON Schema 자동 생성
