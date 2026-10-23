@@ -10,8 +10,6 @@ use ollama_rs::Ollama;
 use serde_json::json;
 use tokio::io::{self, AsyncWriteExt};
 
-const TASK_GOAL: &str = "collect 50 items and details";
-
 use async_trait::async_trait;
 use chromiumoxide::Page;
 
@@ -215,14 +213,11 @@ async fn main() -> DynResult<()> {
     let mut agent = WebAgent::new(
         "http://localhost",
         31434,
-        "qwen3:14b",
+        "qwen2.5:14b",
         &page_adapter,
-        "collect 50 items and details in 'item_details.json' file. Navigate into each item's detail page (`/i/[id]`) to gather complete outer links and content.",
-        "From the list of items, extract: content, username, links, img_src",
+        "from 'cmsn.info' domain, collect 50 items and details in 'item_details.json' file. Navigate into each item's detail page (`/i/[id]`) to gather complete content. CRITICAL INSTRUCTION: You MUST answer ALL queries EXCLUSIVELY in English.",
+        "From the list of items, extract: content, username, updated_at, links_attached, img_src",
     );
-
-    let file_prompt =
-
 
     // 실행
     agent.run().await?;

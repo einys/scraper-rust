@@ -1,6 +1,6 @@
 use schemars::schema_for;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs;
@@ -9,11 +9,32 @@ use tokio::io::AsyncWriteExt;
 
 use crate::lib::dyn_result::DynError;
 use crate::lib::dyn_result::DynResult;
+use crate::lib::page::ExtractionResult;
 use crate::lib::page::SelectorSchema;
 use crate::PageTrait;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ollama_rs::generation::parameters::FormatType;
 use ollama_rs::Ollama;
+
+use serde_json::Value;
+
+/// 문자열 형태의 숫자("1000")도 정수(1000)로 자동 변환해 주는 custom deserializer
+fn deserialize_number_from_string<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let val = Value::deserialize(deserializer)?;
+    match val {
+        Value::Number(n) => n
+            .as_i64()
+            .map(|v| v as i32)
+            .ok_or_else(|| serde::de::Error::custom("Invalid number")),
+        Value::String(s) => s.parse::<i32>().map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom(
+            "Expected number or numeric string",
+        )),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", content = "params", rename_all = "PascalCase")]
@@ -32,6 +53,7 @@ pub enum AgentAction {
     #[serde(alias = "scroll", alias = "scroll_page", alias = "Scroll")]
     ScrollPage {
         reasoning: String, // 👈 생각 과정 추가
+        #[serde(deserialize_with = "deserialize_number_from_string")] // 👈 "1000"과 1000 모두 수용
         dy: i32,
     },
     /// 특정 CSS 셀렉터 요소를 클릭합니다.
@@ -151,13 +173,18 @@ pub struct ActionHistory {
     pub step: usize,
     pub reasoning: String,
     pub action_name: String,
-    pub status: String, // 예: "Success", "Failed: Element not found"
+    pub status: String,       // 예: "Success", "Failed: Element not found"
+    pub data: Option<String>, // Optional data associated with the action
 }
 impl ActionHistory {
     pub fn to_prompt_string(&self) -> String {
         format!(
-            "Step {}: Action='{}' | Status='{}'\n  Reasoning: {}",
-            self.step, self.action_name, self.status, self.reasoning
+            "Step {}: Action='{}' | Status='{}'\n  Reasoning: {}\n  Data: {}",
+            self.step,
+            self.action_name,
+            self.status,
+            self.reasoning,
+            self.data.as_ref().map_or("None".to_string(), |d| d.clone())
         )
     }
 }
@@ -174,6 +201,7 @@ pub struct WebAgent<'a, P: PageTrait> {
     history: Vec<ActionHistory>,
     max_history_depth: usize, // 토큰 폭발 방지를 위한 최근 기록 유지 개수
     pub selectors_cache: HashMap<String, SelectorSchema>,
+    last_seen_page_data: Option<ExtractionResult>,
 }
 
 impl<'a, P: PageTrait> WebAgent<'a, P> {
@@ -197,8 +225,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             task_goal: task_goal.to_string(),
             target_description: target_description.to_string(),
             history: Vec::new(),
-            max_history_depth: 10, // 기본적으로 최근 10개의 이전 스텝을 저장합니다.
-
+            max_history_depth: 8, // 기본적으로 최근 8개의 이전 스텝을 저장합니다.
+            last_seen_page_data: None,
             selectors_cache: HashMap::default(),
         }
     }
@@ -213,7 +241,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
     pub async fn try_extract_with_cached_selectors(
         &mut self,
         route_key: &str, // 예: "list" / "detail"
-    ) -> DynResult<Option<serde_json::Value>> {
+    ) -> DynResult<Option<ExtractionResult>> {
         let Some(selectors) = self.selectors_cache.get(route_key) else {
             return Ok(None);
         };
@@ -223,7 +251,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         match self.page.extract_element_info_by_selectors(selectors).await {
             Ok(result) if !result.data.is_empty() => {
                 println!("✅ [Quick Check] 성공: {:#?}", result);
-                Ok(Some(serde_json::to_value(&result)?))
+                Ok(Some(result))
             }
             Ok(_) => {
                 println!("❌ [Quick Check] 추출 결과가 비어 있음");
@@ -311,12 +339,20 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 ),
             };
 
+            // Extract data from result_summary if it exists
+            let data = if result_summary.contains("Data: ") {
+                Some(result_summary.split("Data: ").nth(1).unwrap().to_string())
+            } else {
+                None
+            };
+
             // 4. Record: 행동 명칭, 이유, 실행 결과를 히스토리에 기록
             let history_entry = ActionHistory {
                 step,
                 action_name,
                 reasoning,
                 status: result_summary,
+                data,
             };
             self.history.push(history_entry);
             self.trim_history();
@@ -331,6 +367,9 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         }
         Ok(())
     }
+
+    // 히스토리에서 <Data></Data> 패턴을 모두 삭제하고 action 기록만 남깁니다.
+    fn clean_history_data(&self) {}
 
     /// schemars로 만든 스키마를 LLM 전달용으로 축소
     fn build_compact_action_guide(&self) -> String {
@@ -418,6 +457,7 @@ Respond with a SINGLE JSON object matching this exact shape:
 }}
 
 Do NOT wrap response in markdown code blocks. Do NOT output extra text.
+DO NOT repeat same action 3 times in a row.
 
 [Your Action History]
 {}
@@ -524,51 +564,122 @@ Do NOT wrap response in markdown code blocks. Do NOT output extra text.
         obs: &AgentObservation,
     ) -> DynResult<(LoopControl, String)> {
         match action {
-            AgentAction::BackPage { reasoning } => {
-                println!("[Action] Navigate back: {}", reasoning);
-                match self.page.go_back().await {
-                    Ok(_) => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        Ok((
-                            LoopControl::Continue,
-                            "Successfully navigated back.".to_string(),
-                        ))
-                    }
-                    Err(e) => Ok((
-                        LoopControl::Continue,
-                        format!("Failed to navigate back: {}", e),
-                    )),
-                }
-            }
-
             AgentAction::ReadFile { filename, .. } => {
                 println!("[Action] 파일 읽기 실행: {}", filename);
                 let path = Path::new(filename);
                 if !path.exists() {
                     return Ok((
                         LoopControl::Continue,
-                        format!("File not found: '{}'", filename),
+                        format!(
+                            "ActionHistory {{ step: \"read\", reasoning: \"File check failed\", action_name: \"ReadFile\", status: \"failed: file not found\" }} <data>File not found: '{}'</data>",
+                            filename
+                        ),
                     ));
                 }
 
                 match tokio::fs::read_to_string(filename).await {
                     Ok(content) => {
-                        let truncated = if content.chars().count() > 50 {
-                            format!("{}...", content.chars().take(47).collect::<String>())
-                        } else {
-                            content
-                        };
+                        println!("파일 읽기 완료 ({} bytes)", content.len());
+
                         Ok((
                             LoopControl::Continue,
                             format!(
-                                "Successfully read file '{}'. Preview: '{}'",
-                                filename, truncated
+                                "ActionHistory {{ step: \"read\", reasoning: \"File read successful\", action_name: \"ReadFile\", status: \"success\" }} <data>{}</data>",
+                                content
                             ),
                         ))
                     }
                     Err(e) => Ok((
                         LoopControl::Continue,
-                        format!("Failed to read file '{}': {}", filename, e),
+                        format!(
+                            "ActionHistory {{ step: \"read\", reasoning: \"File read error\", action_name: \"ReadFile\", status: \"failed\" }} <data>Failed to read file '{}': {}</data>",
+                            filename, e
+                        ),
+                    )),
+                }
+            }
+
+            AgentAction::ScrollPage { dy, .. } => {
+                println!("[Action] 페이지 스크롤: dy={}", dy);
+
+                let result = self
+                    .page
+                    .evaluate(&format!("window.scrollBy(0, {});", dy))
+                    .await;
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                match result {
+                    Ok(_) => Ok((
+                        LoopControl::Continue,
+                        format!(
+                            "ActionHistory {{ step: \"scroll\", reasoning: \"Page scrolled successfully\", action_name: \"ScrollPage\", status: \"success\" }} <data>Scrolled page by {}px</data>",
+                            dy
+                        ),
+                    )),
+                    Err(e) => Ok((
+                        LoopControl::Continue,
+                        format!(
+                            "ActionHistory {{ step: \"scroll\", reasoning: \"Page scroll failed\", action_name: \"ScrollPage\", status: \"failed\" }} <data>Failed to scroll page by {}px: {}</data>",
+                            dy, e
+                        ),
+                    )),
+                }
+            }
+
+            AgentAction::ClickElement { selector, .. } => {
+                println!("[Action] 요소 클릭 실행: {}", selector);
+
+                // Tailwind 클래스 특수문자 이스케이프 적용
+                let safe_selector = crate::lib::page::escape_tailwind_selector(selector);
+
+                match self.page.find_element(&safe_selector).await {
+                    Ok(elem) => match elem.click().await {
+                        Ok(_) => {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            Ok((
+                                LoopControl::Continue,
+                                format!(
+                                    "ActionHistory {{ step: \"click\", reasoning: \"Element clicked successfully\", action_name: \"ClickElement\", status: \"success\" }} <data>Successfully clicked element '{}'</data>",
+                                    selector
+                                ),
+                            ))
+                        }
+                        Err(e) => Ok((
+                            LoopControl::Continue,
+                            format!(
+                                "ActionHistory {{ step: \"click\", reasoning: \"Element click failed\", action_name: \"ClickElement\", status: \"failed\" }} <data>Failed to click element '{}': {}</data>",
+                                selector, e
+                            ),
+                        )),
+                    },
+                    Err(_) => Ok((
+                        LoopControl::Continue,
+                        format!(
+                            "ActionHistory {{ step: \"click\", reasoning: \"Element not found\", action_name: \"ClickElement\", status: \"not_found\" }} <data>Element not found with selector '{}'</data>",
+                            selector
+                        ),
+                    )),
+                }
+            }
+
+            AgentAction::BackPage { .. } => {
+                println!("[Action] 이전 페이지 이동 (BackPage)");
+
+                match self.page.go_back().await {
+                    Ok(_) => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        Ok((
+                            LoopControl::Continue,
+                            "ActionHistory { step: \"back\", reasoning: \"Navigated back successfully\", action_name: \"BackPage\", status: \"success\" } <data>Successfully navigated back to previous page</data>".to_string(),
+                        ))
+                    }
+                    Err(e) => Ok((
+                        LoopControl::Continue,
+                        format!(
+                            "ActionHistory {{ step: \"back\", reasoning: \"Back navigation failed\", action_name: \"BackPage\", status: \"failed\" }} <data>Failed to navigate back: {}</data>",
+                            e
+                        ),
                     )),
                 }
             }
@@ -577,88 +688,73 @@ Do NOT wrap response in markdown code blocks. Do NOT output extra text.
                 filename, content, ..
             } => {
                 println!("[Action] 파일 쓰기 실행: {}", filename);
+
                 match tokio::fs::write(filename, content).await {
                     Ok(_) => Ok((
                         LoopControl::Continue,
                         format!(
-                            "Successfully wrote {} bytes to '{}'",
+                            "ActionHistory {{ step: \"write\", reasoning: \"File write successful\", action_name: \"WriteFile\", status: \"success\" }} <data>Successfully wrote {} bytes to '{}'</data>",
                             content.len(),
                             filename
                         ),
                     )),
                     Err(e) => Ok((
                         LoopControl::Continue,
-                        format!("Failed to write to file '{}': {}", filename, e),
+                        format!(
+                            "ActionHistory {{ step: \"write\", reasoning: \"File write failed\", action_name: \"WriteFile\", status: \"failed\" }} <data>Failed to write to file '{}': {}</data>",
+                            filename, e
+                        ),
                     )),
-                }
-            }
-
-            AgentAction::ScrollPage { dy, .. } => {
-                println!("[Action] 페이지 스크롤: dy={}", dy);
-                self.page
-                    .evaluate(&format!("window.scrollBy(0, {});", dy))
-                    .await?;
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                Ok((LoopControl::Continue, format!("Scrolled page by {}px", dy)))
-            }
-
-            AgentAction::ClickElement { selector, .. } => {
-                println!("[Action] 요소 클릭 실행: {}", selector);
-                // click 로직 예시
-                match self.page.find_element(selector).await {
-                    Ok(elem) => match elem.click().await {
-                        Ok(_) => Ok((
-                            LoopControl::Continue,
-                            format!("Successfully clicked element '{}'", selector),
-                        )),
-                        Err(e) => Ok((
-                            LoopControl::Continue,
-                            format!("Failed to click element '{}': {}", selector, e),
-                        )),
-                    },
-                    Err(_) => Ok((
-                        LoopControl::Continue,
-                        format!("Element not found with selector '{}'", selector),
-                    )),
-                }
-            }
-
-            AgentAction::ExtractData { .. } => {
-                println!("[Action] 데이터 추출 실행:");
-
-                // 기존에 기억하는 셀렉터로 데이터 추출 시도
-                if let Ok(Some(extracted_data)) = self
-                    .try_extract_with_cached_selectors(&obs.current_url)
-                    .await
-                {
-                    println!("추출된 데이터: {:?}", extracted_data);
-
-                    Ok((
-                        LoopControl::Continue,
-                        format!("Extracted data using existing selectors"),
-                    ))
-                } else {
-                    // 💡 WebAgent 내부 메서드로 깔끔하게 호출
-                    let selectors = self.extract_selectors(&obs.simplified_dom).await?;
-                    let extracted_data =
-                        crate::lib::page::extract_data_with_selectors(self.page, &selectors)
-                            .await?;
-
-                    println!("추출된 데이터: {:?}", extracted_data);
-
-                    // 셀렉터 캐시 업데이트
-                    self.selectors_cache
-                        .insert(obs.current_url.clone(), selectors);
-                    Ok((
-                        LoopControl::Continue,
-                        format!("Extracted data using selectors"),
-                    ))
                 }
             }
 
             AgentAction::Finish { reason, .. } => {
                 println!("[Action] 작업 완료: {}", reason);
-                Ok((LoopControl::Finish, format!("Finished task: {}", reason)))
+                Ok((
+                    LoopControl::Finish,
+                    format!(
+                        "ActionHistory {{ step: \"finish\", reasoning: \"Task completed\", action_name: \"Finish\", status: \"success\" }} <data>Task finished with reason: {}</data>",
+                        reason
+                    ),
+                ))
+            }
+
+            AgentAction::ExtractData { .. } => {
+                println!("[Action] 데이터 추출 실행:");
+
+                let (extracted_data, is_cached) = if let Ok(Some(data)) = self
+                    .try_extract_with_cached_selectors(&obs.current_url)
+                    .await
+                {
+                    (data, true)
+                } else {
+                    let selectors = self.extract_selectors(&obs.simplified_dom).await?;
+                    let data = crate::lib::page::extract_data_with_selectors(self.page, &selectors)
+                        .await?;
+                    self.selectors_cache
+                        .insert(obs.current_url.clone(), selectors);
+                    (data, false)
+                };
+
+                println!("추출된 데이터: {:?}", extracted_data);
+
+                // 💡 에이전트 내부 메모리에 보관
+                self.last_seen_page_data = Some(extracted_data.clone());
+
+                let status_str = if is_cached {
+                    "success (cached selectors)"
+                } else {
+                    "success (new selectors)"
+                };
+
+                Ok((
+                    LoopControl::Continue,
+                    format!(
+                        "ActionHistory {{ step: \"extract\", reasoning: \"Data extraction successful\", action_name: \"ExtractData\", status: \"{}\" }} <data>{}</data>",
+                        status_str,
+                        extracted_data.to_string()
+                    ),
+                ))
             }
         }
     }
