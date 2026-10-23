@@ -1,0 +1,34 @@
+{
+  "data": {
+    "updated_at": {
+      "selector": ".card [text='GG 커미션']",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "links_attached": {
+      "selector": ".card .card a[href]",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "username": {
+      "selector": ".card .card .max-w-30",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "content": {
+      "selector": ".card .prose-slate span:not([text])",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "img_src": {
+      "selector": ".card .card img",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "data": {
+    "username": {
+      "selector": ".card .card a[group='link'] span[max-w='30']",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "img_src": {
+      "selector": ".card .card img",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "content": {
+      "selector": ".card .prose-slate span",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "updated_at": {
+      "selector": ".card .card a[group='link'] span[tracking='tight']",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "links_attached": {
+      "selector": ".card .card a",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    }
+  }
+}

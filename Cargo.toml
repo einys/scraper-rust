@@ -18,3 +18,4 @@ async-trait = "0.1.92"
 env = "1.0.1"
 schemars = "0.8"                                      # Enum/Struct 기반 JSON Schema 자동 생성
 regex = "1.13.1"
+indicatif = "0.18.6"

@@ -121,18 +121,39 @@ impl fmt::Display for SelectorSchema {
     }
 }
 
-use regex::Regex;
+use regex::{Captures, Regex};
 use std::sync::OnceLock;
 
-/// Tailwind CSS 특수문자(:, [, ], /, %)를 querySelector 호환 형식으로 이스케이프하는 정규식
-static TAILWIND_ESCAPE_REGEX: OnceLock<Regex> = OnceLock::new();
+static TAILWIND_SANITY_REGEX: OnceLock<Regex> = OnceLock::new();
 
-pub fn escape_tailwind_selector(selector: &str) -> String {
-    let re = TAILWIND_ESCAPE_REGEX.get_or_init(|| {
-        Regex::new(r"([:\[\]/%])").expect("Failed to compile Tailwind escape regex")
+/// Tailwind 클래스의 모든 특수문자(:, [, ], /, %, 소수점)를 단일 패스로 정밀 이스케이프
+pub fn sanitize_selector(selector: &str) -> String {
+    let trim_sel = selector.trim();
+    if trim_sel.is_empty() {
+        return String::new();
+    }
+
+    // 1. 소수점 클래스 이스케이프 (.mx-0.5 -> .mx-0\.5)
+    let re_float = Regex::new(r"\.([a-zA-Z0-9_\-]+)\.([0-9]+)").unwrap();
+    let step1 = re_float.replace_all(trim_sel, |caps: &Captures| {
+        format!(".{}\\{}", &caps[1], &caps[2])
     });
-    re.replace_all(selector, r"\$1").to_string()
+
+    // 2. 분수/슬래시 클래스 이스케이프 (.top-1/2 -> .top-1\/2)
+    let re_slash = Regex::new(r"\.([a-zA-Z0-9_\-]+)/([a-zA-Z0-9_\-]+)").unwrap();
+    let step2 = re_slash.replace_all(&step1, |caps: &Captures| {
+        format!(".{}\\{}", &caps[1], &caps[2])
+    });
+
+    // 3. 임의 값 대괄호 클래스 이스케이프 (.text-[10px] -> .text-\[10px\])
+    let re_bracket = Regex::new(r"\.([a-zA-Z0-9_\-]+)\[([^\]]+)\]").unwrap();
+    let step3 = re_bracket.replace_all(&step2, |caps: &Captures| {
+        format!(".{}\\[{}\\]", &caps[1], &caps[2])
+    });
+
+    step3.to_string()
 }
+
 // selector 받고 -> 내용, 원본, x y 좌표 담긴 구조체 리턴
 pub async fn get_element_info<P: PageTrait + ?Sized>(
     page: &P,
@@ -140,7 +161,7 @@ pub async fn get_element_info<P: PageTrait + ?Sized>(
 ) -> Result<Option<ExtractedElementInfo>, DynError> {
     // 1. Rust 단에서 1차적으로 Tailwind 특수문자 이스케이프
     // 1. 셀렉터 정제 및 serde_json으로 JS 문자열 리터럴 생성
-    let safe_selector = escape_tailwind_selector(raw_selector);
+    let safe_selector = sanitize_selector(raw_selector);
     let selector_json = serde_json::to_string(&safe_selector)?; // 👈 "\" .flex-1... \"" 형태의 올바른 JS 문자열 생성
     let js_script = format!(
         r#"
