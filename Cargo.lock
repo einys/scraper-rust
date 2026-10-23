@@ -2134,6 +2134,7 @@ dependencies = [
  "env",
  "futures",
  "ollama-rs",
+ "regex",
  "reqwest 0.13.5",
  "schemars 0.8.22",
  "scraper",

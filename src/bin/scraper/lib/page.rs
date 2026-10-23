@@ -1,12 +1,66 @@
+use async_trait::async_trait;
 use ollama_rs::generation::parameters::FormatType;
 use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
+use schemars::JsonSchema;
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 
-use crate::lib::dyn_result::DynError;
-use crate::PageTrait;
+use crate::lib::dyn_result::{DynError, DynResult};
+use serde_json::{json, Value};
+
+use std::{env, fmt};
+// 1. 공통 에러/Result 타입 별칭 정의
+
+// 2. ElementTrait 선언
+#[async_trait]
+pub trait ElementTrait: Send + Sync {
+    async fn click(&self) -> DynResult<()>;
+}
+
+#[async_trait]
+pub trait PageTrait: Send + Sync {
+    async fn evaluate(&self, script: &str) -> DynResult<String>;
+    async fn find_element(&self, selector: &str) -> DynResult<Box<dyn ElementTrait>>;
+    async fn content(&self) -> DynResult<String>;
+    async fn go_back(&self) -> DynResult<()>;
+    async fn current_url(&self) -> DynResult<String>;
+    async fn navigate(&self, url: &str) -> DynResult<()>;
+    async fn screenshot(&self) -> DynResult<Vec<u8>>;
+
+    /// SelectorSchema에 정의된 필드들을 순회하며 ExtractionResult 생성
+    async fn extract_element_info_by_selectors(
+        &self,
+        schema: &SelectorSchema,
+    ) -> DynResult<ExtractionResult> {
+        // 요약 및 구조정리
+
+        //  "셀렉터로 찾은 item들은 여러 개일 수 있다"의 의미:
+        //         한 페이지에 존재하는 여러 필드들(title, price, image 등) 각각을 가리키는 셀렉터들을 모아둔 것이 SelectorSchema입니다.
+        //         따라서 HashMap 키로는 CSS 셀렉터 문자열 자체가 아니라, "title", "price" 같은 필드 이름(Field Name)이 들어가야 나중에 데이터 가공이나 파일 저장이 수월해집니다.
+
+        // TODO: query="SelectorSchema의 container 셀렉터를 기준으로 목록 내 여러 아이템을 Vec으로 한 번에 추출하는 메서드로 확장해드릴까요?"
+        let mut data = HashMap::new();
+
+        for (field_name, field_selector) in &schema.fields {
+            // container 셀렉터와 field 셀렉터 결합
+            let full_selector = if schema.container.trim().is_empty() {
+                field_selector.clone()
+            } else {
+                format!("{} {}", schema.container, field_selector)
+            };
+
+            // 개별 셀렉터로 DOM 요소 정보(좌표, 텍스트, HTML) 추출
+            if let Ok(Some(info)) = get_element_info(self, &full_selector).await {
+                // key: 필드명("title", "link" 등), value: 추출된 요소 정보
+                data.insert(field_name.clone(), info);
+            }
+        }
+
+        Ok(ExtractionResult { data })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElementRect {
@@ -25,16 +79,33 @@ pub struct ExtractedElementInfo {
     pub rect: Option<ElementRect>,
 }
 
+impl ExtractedElementInfo {
+    /// 요소의 중앙 좌표 계산 (마우스 클릭용)
+    pub fn get_center_coordinates(&self) -> Option<(f64, f64)> {
+        self.rect.as_ref().map(|r| {
+            let center_x = r.x + (r.width / 2.0);
+            let center_y = r.y + (r.height / 2.0);
+            (center_x, center_y)
+        })
+    }
+}
+
 /// 최종 JSON 결과 (필드명 -> ExtractedElementInfo)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionResult {
     pub data: HashMap<String, ExtractedElementInfo>,
 }
-use serde_json::{json, Value};
 
-use std::{env, fmt};
+impl fmt::Display for ExtractionResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match serde_json::to_string_pretty(&self.data) {
+            Ok(json) => write!(f, "{}", json),
+            Err(_) => Err(fmt::Error),
+        }
+    }
+}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)] // 👈 JsonSchema 추가!
 pub struct SelectorSchema {
     pub container: String,
     pub fields: HashMap<String, String>,
@@ -50,22 +121,37 @@ impl fmt::Display for SelectorSchema {
     }
 }
 
-// selector 받고 -> 내용, 원본, x y 좌표 담긴 구조체 리턴
-pub async fn get_element_info<P: PageTrait>(
-    page: &P,
-    selector: &str,
-) -> Result<Option<ExtractedElementInfo>, DynError> {
-    // JS 문자열 이스케이프 및 안전성을 위해 JSON.stringify 사용
-    let selector_json = serde_json::to_string(selector)?;
+use regex::Regex;
+use std::sync::OnceLock;
 
+/// Tailwind CSS 특수문자(:, [, ], /, %)를 querySelector 호환 형식으로 이스케이프하는 정규식
+static TAILWIND_ESCAPE_REGEX: OnceLock<Regex> = OnceLock::new();
+
+pub fn escape_tailwind_selector(selector: &str) -> String {
+    let re = TAILWIND_ESCAPE_REGEX.get_or_init(|| {
+        Regex::new(r"([:\[\]/%])").expect("Failed to compile Tailwind escape regex")
+    });
+    re.replace_all(selector, r"\$1").to_string()
+}
+// selector 받고 -> 내용, 원본, x y 좌표 담긴 구조체 리턴
+pub async fn get_element_info<P: PageTrait + ?Sized>(
+    page: &P,
+    raw_selector: &str,
+) -> Result<Option<ExtractedElementInfo>, DynError> {
+    // 1. Rust 단에서 1차적으로 Tailwind 특수문자 이스케이프
+    // 1. 셀렉터 정제 및 serde_json으로 JS 문자열 리터럴 생성
+    let safe_selector = escape_tailwind_selector(raw_selector);
+    let selector_json = serde_json::to_string(&safe_selector)?; // 👈 "\" .flex-1... \"" 형태의 올바른 JS 문자열 생성
     let js_script = format!(
         r#"
         (() => {{
-            const el = document.querySelector({selector_json});
+            const rawSelector = {}; // 👈 "..." 따옴표가 자동 포함된 문자열로 안전하게 주입됨
+
+            const el = document.querySelector(rawSelector);
             if (!el) return null;
             const rect = el.getBoundingClientRect();
             return {{
-                selector: {selector_json},
+                selector: rawSelector,
                 text_content: el.innerText ? el.innerText.trim() : el.textContent.trim(),
                 outer_html: el.outerHTML,
                 rect: {{
@@ -76,7 +162,8 @@ pub async fn get_element_info<P: PageTrait>(
                 }}
             }};
         }})()
-        "#
+        "#,
+        selector_json
     );
 
     // null인 경우 deserialization 에러를 피하고 Option<ExtractedElementInfo>로 매핑
@@ -89,7 +176,7 @@ pub async fn get_element_info<P: PageTrait>(
             }
         }
         Err(e) => {
-            eprintln!("Evaluation 오류: {} of selector_json: {}", e, selector_json);
+            eprintln!("Evaluation 오류: {} of selector_json: {}", e, safe_selector);
             None
         }
     };
@@ -100,7 +187,7 @@ pub async fn get_element_info<P: PageTrait>(
 pub async fn extract_data_with_selectors<P: PageTrait>(
     page: &P,
     schema: &SelectorSchema,
-) -> Result<String, DynError> {
+) -> Result<ExtractionResult, DynError> {
     // LLM 결과에서 JSON 부분 추출 (마크다운 ```json ... ``` 응답 대응)
     // let clean_json_str = parse_json_from_llm_response(llm_selector_json_str);
     // 💡 문자열 파싱 과정(parse_json_from_llm_response)이 제거되고
@@ -133,8 +220,8 @@ pub async fn extract_data_with_selectors<P: PageTrait>(
     let extraction_result = ExtractionResult { data: final_data };
 
     // 예쁘게 정렬된 JSON 문자열로 반환
-    let json_output = serde_json::to_string_pretty(&extraction_result)?;
-    Ok(json_output)
+    //let json_output = serde_json::to_string_pretty(&extraction_result)?;
+    Ok(extraction_result)
 }
 
 /// LLM 응답에 섞인 마크다운 코드블록 제거용 헬퍼 함수
@@ -152,13 +239,26 @@ pub fn parse_json_from_llm_response(raw_response: &str) -> String {
 // 1. DOM 축약 간소화 트리 생성
 // ============================================================================
 
-/// 브라우저 DOM에서 크롤링/스크래핑 관점에서 의미 있는 핵심 태그, id, class, 주요 속성만 남긴 간소화된 DOM 텍스트 트리를 추출합니다.
+/// 브라우저 DOM에서 크롤링/스크래핑 관점에서 의미 있는 핵심 태그, id, class, 주요 속성 및 data-* 속성을 포함한 간소화된 DOM 텍스트 트리를 추출합니다.
 pub async fn get_simplified_dom_tree<P: PageTrait>(page: &P) -> Result<String, DynError> {
-    // DynError가 Box<dyn StdError + Send + Sync> 형태이므로,
-    // 해당 에러 타입이 std::error::Error를 구현하고 있다면 ? 연산자에 의해
-    // DynError로 자동 포장(From 변환)되어 상위 호출자로 즉시 반환됩니다.
     let js_script = r#"
         (() => {
+            // 💡 1. DOM에 data-index가 없으면 자체적으로 자동 주입 (전처리)
+            const listContainers = document.querySelectorAll(
+                '#masonry, ul, ol, [class*="grid"], [class*="list"], [class*="flex-col"], [class*="masonry"]'
+            );
+
+            listContainers.forEach(container => {
+                const children = Array.from(container.children);
+                if (children.length >= 2) {
+                    children.forEach((child, idx) => {
+                        if (!child.hasAttribute('data-index')) {
+                            child.setAttribute('data-index', idx.toString());
+                        }
+                    });
+                }
+            });
+
             const SIGNIFICANT_TAGS = new Set([
                 'body', 'header', 'nav', 'main', 'article', 'section', 'aside', 'footer',
                 'div', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'img', 'span',
@@ -195,6 +295,13 @@ pub async fn get_simplified_dom_tree<P: PageTrait>(page: &P) -> Result<String, D
                     attrStr += ` name="${node.getAttribute('name')}"`;
                 }
 
+                // 💡 원본이거나 전처리로 주입된 data-index를 포함한 모든 data-* 속성 수집 추가
+                for (const attr of node.attributes) {
+                    if (attr.name.startsWith('data-')) {
+                        attrStr += ` ${attr.name}="${attr.value}"`;
+                    }
+                }
+
                 let directText = '';
                 for (const child of node.childNodes) {
                     if (child.nodeType === Node.TEXT_NODE) {
@@ -209,7 +316,7 @@ pub async fn get_simplified_dom_tree<P: PageTrait>(page: &P) -> Result<String, D
                 const textAttr = directText ? ` text="${directText}"` : '';
                 let result = `${indent}<${tagName}${attrStr}${textAttr}>\n`;
 
-                // 🔥 핵심: 자식 노드들의 "태그명+클래스명" 조합으로 그룹핑하여 무한 반복을 3개로 자름
+                // 자식 노드들의 "태그명+클래스명" 조합으로 그룹핑하여 무한 반복을 3개로 자름
                 const childCounts = new Map();
                 let truncatedCount = 0;
 
@@ -240,7 +347,7 @@ pub async fn get_simplified_dom_tree<P: PageTrait>(page: &P) -> Result<String, D
 
             return buildTree(document.body || document.documentElement);
         })()
-        "#;
+    "#;
 
     let tree: String = page.evaluate(js_script).await?;
     Ok(tree)

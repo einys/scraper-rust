@@ -1,9 +1,9 @@
 use schemars::schema_for;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
+use tokio::fs;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
@@ -16,17 +16,20 @@ use ollama_rs::generation::parameters::FormatType;
 use ollama_rs::Ollama;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "action", content = "params")]
+#[serde(tag = "action", content = "params", rename_all = "PascalCase")]
 pub enum AgentAction {
     /// 파일을 읽어옵니다.
+    #[serde(alias = "read", alias = "read_file", alias = "Read")]
     ReadFile { reasoning: String, filename: String },
     /// 파일에 텍스트 내용을 쓰거나 추가합니다.
+    #[serde(alias = "write", alias = "write_file", alias = "Write")]
     WriteFile {
         reasoning: String, // 👈 생각 과정 추가
         filename: String,
         content: String,
     },
     /// 수직으로 페이지를 스크롤합니다.
+    #[serde(alias = "scroll", alias = "scroll_page", alias = "Scroll")]
     ScrollPage {
         reasoning: String, // 👈 생각 과정 추가
         dy: i32,
@@ -38,15 +41,14 @@ pub enum AgentAction {
         selector: String,
     },
     /// 모든 수집 목표를 완료하고 에이전트를 종료합니다.
+    #[serde(alias = "finish", alias = "finish_agent", alias = "Finish")]
     Finish {
         reasoning: String, // 👈 생각 과정 추가
         reason: String,
     },
     /// DOM에서 원하는 셀렉터 목록으로 데이터를 추출합니다.
-    ExtractData {
-        reasoning: String,
-        selectors: Vec<String>,
-    },
+    #[serde(alias = "extract", alias = "extract_data", alias = "Extract")]
+    ExtractData { reasoning: String },
     /// go back to the previous page.
     #[serde(alias = "back", alias = "back_page", alias = "Back")]
     BackPage {
@@ -89,8 +91,8 @@ impl AgentAction {
             AgentAction::ScrollPage { dy, .. } => format!("ScrollPage(dy={})", dy),
             AgentAction::ClickElement { selector, .. } => format!("ClickElement({})", selector),
             AgentAction::Finish { reason, .. } => format!("Finish({})", reason),
-            AgentAction::ExtractData { selectors, .. } => {
-                format!("ExtractData(count={})", selectors.len())
+            AgentAction::ExtractData { .. } => {
+                format!("ExtractData")
             }
             AgentAction::BackPage { .. } => "BackPage".to_string(),
         }
@@ -100,17 +102,41 @@ impl AgentAction {
 pub struct AgentObservation {
     pub simplified_dom: String,
     pub html_content: String,
+    pub current_url: String,
     // 필요 시 추가 가능 (예: pub current_url: String, pub screenshot: Vec<u8>)
 }
 
 impl AgentObservation {
     pub async fn capture<P: PageTrait>(page: &P) -> DynResult<Self> {
+        // 1. 새 탭은 에이전트가 다루기 어려우므로 새 탭 열림을 page 관찰 즉시 무력화 (target 속성 제거 & window.open 오버라이딩)
+        let sanitize_js = r#"
+                    (() => {
+                        // target 속성 제거
+                        document.querySelectorAll('a[target]').forEach(el => {
+                            el.removeAttribute('target');
+                        });
+
+                        // window.open 호출 시 현재 창 이동으로 덮어쓰기
+                        window.open = function(url) {
+                            if (url) {
+                                window.location.href = url;
+                            }
+                            return window;
+                        };
+                    })();
+                "#;
+
+        // 오류가 나더라도 관측 자체가 깨지지 않도록 비동기 실행 및 에러 무시 처리
+        let _ = page.evaluate(sanitize_js).await;
+
         let simplified_dom = crate::lib::page::get_simplified_dom_tree(page).await?;
         let html_content = page.content().await?;
+        let current_url = page.current_url().await?;
 
         Ok(Self {
             simplified_dom,
             html_content,
+            current_url,
         })
     }
 }
@@ -138,12 +164,6 @@ impl ActionHistory {
 
 use std::collections::HashMap;
 
-#[derive(Default)]
-pub struct RouteSelectors {
-    // Route pattern (e.g., "/i/[id]" or "list_page") -> Selector List
-    pub cache: HashMap<String, Vec<String>>,
-}
-
 pub struct WebAgent<'a, P: PageTrait> {
     ollama: Ollama,
     model: String,
@@ -153,7 +173,7 @@ pub struct WebAgent<'a, P: PageTrait> {
     // 💡 스텝별 행동 기록을 누적 보관하는 필드 추가
     history: Vec<ActionHistory>,
     max_history_depth: usize, // 토큰 폭발 방지를 위한 최근 기록 유지 개수
-    pub selectors_cache: RouteSelectors,
+    pub selectors_cache: HashMap<String, SelectorSchema>,
 }
 
 impl<'a, P: PageTrait> WebAgent<'a, P> {
@@ -170,7 +190,6 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             .host(ollama_host.to_string())
             .port(ollama_port)
             .build();
-
         Self {
             ollama,
             model: model.to_string(),
@@ -179,7 +198,67 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             target_description: target_description.to_string(),
             history: Vec::new(),
             max_history_depth: 10, // 기본적으로 최근 10개의 이전 스텝을 저장합니다.
+
+            selectors_cache: HashMap::default(),
         }
+    }
+
+    // 💡 max_history_depth를 고려하여 history를 제한하는 메소드 추가
+    pub fn trim_history(&mut self) {
+        if self.history.len() > self.max_history_depth {
+            self.history.pop();
+        }
+    }
+    /// 페이지 접근 시 먼저 기존 셀렉터로 즉시 추출을 시도하는 메서드
+    pub async fn try_extract_with_cached_selectors(
+        &mut self,
+        route_key: &str, // 예: "list" / "detail"
+    ) -> DynResult<Option<serde_json::Value>> {
+        let Some(selectors) = self.selectors_cache.get(route_key) else {
+            return Ok(None);
+        };
+
+        println!("⚡ [Quick Check] 캐시된 셀렉터로 추출 시도...");
+
+        match self.page.extract_element_info_by_selectors(selectors).await {
+            Ok(result) if !result.data.is_empty() => {
+                println!("✅ [Quick Check] 성공: {:#?}", result);
+                Ok(Some(serde_json::to_value(&result)?))
+            }
+            Ok(_) => {
+                println!("❌ [Quick Check] 추출 결과가 비어 있음");
+                Ok(None)
+            }
+            Err(e) => {
+                println!("❌ [Quick Check] 추출 실패: {}", e);
+                Ok(None)
+            }
+        }
+    }
+
+    pub async fn append_item_to_file(
+        &self,
+        filename: &str,
+        data: serde_json::Value,
+    ) -> DynResult<()> {
+        let path = Path::new(filename);
+
+        // 1. 기존 파일이 존재하면 읽어서 Vec<serde_json::Value>로 파싱, 없으면 새 Vec 생성
+        let mut items: Vec<serde_json::Value> = if path.exists() {
+            let content = fs::read_to_string(path).await.unwrap_or_default();
+            serde_json::from_str(&content).unwrap_or_else(|_| Vec::new())
+        } else {
+            Vec::new()
+        };
+
+        // 2. 새 아이템 추가
+        items.push(data);
+
+        // 3. 예쁘게 포맷팅된 JSON 문자열로 직렬화 후 비동기 쓰기
+        let updated_json = serde_json::to_string_pretty(&items)?;
+        fs::write(path, updated_json).await?;
+
+        Ok(())
     }
 
     /// 메인 루프 실행 메서드
@@ -190,8 +269,11 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
 
             // 1. Observe: 스텝 시작 시 관측
             let obs = AgentObservation::capture(self.page).await?;
+            // 1. Observe: 현재 페이지 DOM 및 URL 관측
+            let current_route = &obs.current_url; // 예: "items_detail" 또는 "items_list"
+                                                  // 2. Fast Path: 기존 셀렉터 재사용 시도
 
-            // 2. Think: LLM 추론 (최대 3회 재시도)
+            // 3. Think: LLM 추론 (최대 3회 재시도)
             let mut action_result = None;
             for attempt in 1..=3 {
                 match self.ask_step(&obs.simplified_dom).await {
@@ -237,6 +319,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 status: result_summary,
             };
             self.history.push(history_entry);
+            self.trim_history();
 
             // 5. Termination Check: 작업 종료 판단
             if matches!(control, LoopControl::Finish) {
@@ -310,7 +393,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         println!("LLM에 다음 단계를 추론하도록 요청합니다.");
         println!(
             "목록에 포함된 Actions List:\n{}...",
-            action_guide.chars().take(50).collect::<String>()
+            action_guide.chars().take(200).collect::<String>()
         );
         println!("History:\n{}", self.compact_history());
 
@@ -335,25 +418,6 @@ Respond with a SINGLE JSON object matching this exact shape:
 }}
 
 Do NOT wrap response in markdown code blocks. Do NOT output extra text.
-
-
-[File Usage Guidelines]
-You must choose the appropriate filename based on the current page URL route structure:
-
-1. For List / Feed Pages (e.g., `cmsn.info/` or main feed):
-   - Selector File: `selectors_list.json`
-   - Data File: `items_list.json`
-
-2. For Item Detail Pages (e.g., `cmsn.info/i/[id]` or any dynamic item route):
-   - Selector File: `selectors_detail.json`
-   - Data File: `items_detail.json`
-
-[File Usage Rules]
-
-- Write and Read data, selectors, in files. Reuse them for same route. Before trying to extract data, check if the data file already exists.
-- When extracting selectors on a detail page (`/i/...`), save or read from `selectors_detail.json` so that all dynamic item routes reuse the exact same schema.
-- When writing extracted item data, append to `items_detail.json` (or `items_list.json` depending on the page type).
-- Do NOT generate unique filenames containing specific IDs (e.g., `items_AAAAA.json` is FORBIDDEN).
 
 [Your Action History]
 {}
@@ -430,7 +494,7 @@ You must choose the appropriate filename based on the current page URL route str
 
                     match serde_json::from_str::<SelectorSchema>(&cleaned_json) {
                         Ok(parsed_schema) => {
-                            println!("Successfully parsed SelectorSchema!");
+                            println!("🥳 Successfully parsed SelectorSchema! These selectors are looking important... {}", parsed_schema);
                             return Ok(parsed_schema);
                         }
                         Err(e) => {
@@ -455,7 +519,7 @@ You must choose the appropriate filename based on the current page URL route str
 
     /// 결정된 Action을 수행하는 헬퍼 메서드 (Tool Calling과 비슷함)
     async fn handle_action(
-        &self,
+        &mut self,
         action: &AgentAction,
         obs: &AgentObservation,
     ) -> DynResult<(LoopControl, String)> {
@@ -559,22 +623,37 @@ You must choose the appropriate filename based on the current page URL route str
                 }
             }
 
-            AgentAction::ExtractData { selectors, .. } => {
-                println!("[Action] 데이터 추출 실행: {:?}", selectors);
+            AgentAction::ExtractData { .. } => {
+                println!("[Action] 데이터 추출 실행:");
 
-                // 💡 WebAgent 내부 메서드로 깔끔하게 호출
-                let selectors = self.extract_selectors(&obs.simplified_dom).await?;
-                let extracted_data =
-                    crate::lib::page::extract_data_with_selectors(self.page, &selectors).await?;
+                // 기존에 기억하는 셀렉터로 데이터 추출 시도
+                if let Ok(Some(extracted_data)) = self
+                    .try_extract_with_cached_selectors(&obs.current_url)
+                    .await
+                {
+                    println!("추출된 데이터: {:?}", extracted_data);
 
-                println!("추출된 데이터: {:?}", extracted_data);
-                Ok((
-                    LoopControl::Continue,
-                    format!(
-                        "Extracted data using {} selectors",
-                        selectors.container.len() + selectors.fields.len()
-                    ),
-                ))
+                    Ok((
+                        LoopControl::Continue,
+                        format!("Extracted data using existing selectors"),
+                    ))
+                } else {
+                    // 💡 WebAgent 내부 메서드로 깔끔하게 호출
+                    let selectors = self.extract_selectors(&obs.simplified_dom).await?;
+                    let extracted_data =
+                        crate::lib::page::extract_data_with_selectors(self.page, &selectors)
+                            .await?;
+
+                    println!("추출된 데이터: {:?}", extracted_data);
+
+                    // 셀렉터 캐시 업데이트
+                    self.selectors_cache
+                        .insert(obs.current_url.clone(), selectors);
+                    Ok((
+                        LoopControl::Continue,
+                        format!("Extracted data using selectors"),
+                    ))
+                }
             }
 
             AgentAction::Finish { reason, .. } => {
