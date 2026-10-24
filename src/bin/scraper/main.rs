@@ -1,23 +1,13 @@
-use std::time::Duration;
-
-use tokio::fs::OpenOptions;
-
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::handler::viewport::Viewport;
 use futures::StreamExt; // tokio_stream 대신 이것 하나로 통합
-use ollama_rs::generation::completion::request::GenerationRequest;
-use ollama_rs::Ollama;
-use serde_json::json;
-use tokio::io::{self, AsyncWriteExt};
 
 use async_trait::async_trait;
-use chromiumoxide::Page;
 
 #[path = "lib/lib.rs"]
 mod lib;
 
-use crate::lib::agent::{AgentAction, AgentObservation, WebAgent};
-use crate::lib::dyn_result::DynError;
+use crate::lib::agent::WebAgent;
 use crate::lib::dyn_result::DynResult;
 use crate::lib::page::{ElementTrait, PageTrait};
 // -----------------------------------------------------------------------------
@@ -160,10 +150,10 @@ async fn main() -> DynResult<()> {
     // }
 
     // Get final dom html
-    let html_content = page.content().await?;
+    let _html_content = page.content().await?;
     let page_adapter = ChromiumPageAdapter { page: page };
 
-    let target_description = r#"
+    let _target_description = r#"
         Important Prompt: From the list of items, extract exactly these fields: content(item 상세 내용, description), username, img_src, links_attached"#;
 
     // Goal prompt
@@ -174,7 +164,7 @@ async fn main() -> DynResult<()> {
         "qwen2.5:14b",
         &page_adapter,
         "from 'cmsn.info' domain, collect 50 items and details in 'item_details.json' file. Navigate into each item's detail page (`/i/[id]`) to gather complete content. CRITICAL INSTRUCTION: You MUST answer ALL queries EXCLUSIVELY in English.",
-        "From the list of items, extract: content, username, updated_at, links_attached, img_src",
+        "href",
     );
 
     // 실행

@@ -75,3 +75,47 @@
                     └─ Finish       ➔ LoopControl::Finish ➔ Loop 종료
 
 ```
+
+## 싱글 아이템 페이지에서는 container가 "" (빈 문자열)
+
+container가 있으면 배열, 없으면 싱글!
+
+| 구분                 | 리스트 / 피드 페이지 (`/`)                                          | 싱글 아이템 페이지 (`/i/[id]`)                                  |
+| -------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------- |
+| **데이터 구조**      | 1개 페이지에 **N개의 아이템 카드** 존재                             | 1개 페이지에 **1개의 아이템 상세** 존재                         |
+| **`container` 역할** | 반복되는 각 카드들의 최상위 래퍼 선택자 (예: `div#masonry article`) | **불필요 (`""`)** 또는 페이지 본문 전체 (`main` / `body`)       |
+| **추출 결과 타입**   | `ExtractionData::List(Vec<ExtractedItem>)`                          | `ExtractionData::Single(HashMap<String, ExtractedElementInfo>)` |
+
+---
+
+### 2. 싱글 아이템 페이지에서 `container`를 비워두는 이유
+
+1. **상대 경로 대신 전역 CSS 선택자 사용 가능**
+
+- 상세 페이지에서는 `username`, `content`, `updated_at` 등이 화면에 단 하나만 존재합니다.
+- 굳이 부모 `container`를 거쳐 상대 경로로 접근할 필요 없이 `article header span.name`처럼 **문맥상 전역 고유한 CSS 선택자**를 바로 지정하는 것이 훨씬 간단하고 오진 확률이 낮습니다.
+
+2. **단일 요소의 상세 스펙(좌표, OuterHTML) 수집 용이**
+
+- 상세 페이지의 각 필드는 단순히 텍스트만 뽑는 것 외에, 클릭 위치(`rect`)나 HTML 구조(`outer_html`)를 함께 수집해야 할 때가 많습니다.
+- 앞서 작성한 `get_element_info` 기반의 `ExtractionData::Single` 방식을 그대로 타는 것이 구조적으로 제일 깔끔합니다.
+
+---
+
+### 3. 하네스 처리 흐름
+
+LLM이 생성한 `SelectorSchema`에서 `container` 필드의 존재 여부로 두 모드가 자동 전환되도록 구현해 두시면 됩니다.
+
+```rust
+// schema.container.trim().is_empty() 분기 조건
+if schema.container.trim().is_empty() {
+    // 📄 싱글 아이템 모드: 페이지 전역 단일 선택자로 추출
+    // -> ExtractionData::Single(...)
+} else {
+    // 📑 피드/목록 모드: container 스코프 기반으로 여러 아이템 추출
+    // -> ExtractionData::List(...)
+}
+
+```
+
+> **Tip:** LLM 프롬프트에 **"Detail/Single pages usually do NOT need a container (leave `container` as `\"\"`), whereas Feed/List pages MUST specify a `container`."** 라는 지침을 명시해 두면 LLM이 페이지 종류에 따라 `container` 유무를 스스로 올바르게 결정합니다.

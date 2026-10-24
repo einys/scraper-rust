@@ -8,14 +8,12 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
 
 use crate::lib;
 use crate::lib::dyn_result::DynError;
 use crate::lib::dyn_result::DynResult;
-use crate::lib::page::ExtractionResult;
+use crate::lib::page::ExtractedContent;
+use crate::lib::page::ExtractedContentWrapper;
 use crate::lib::page::SelectorSchema;
 use crate::PageTrait;
 use ollama_rs::generation::completion::request::GenerationRequest;
@@ -158,7 +156,7 @@ pub struct AgentObservation {
     pub html_content: String,
     pub current_url: String,
     pub focused_selectors: Option<SelectorSchema>,
-    pub extracted_data: Option<ExtractionResult>,
+    pub extracted_data: Option<ExtractedContentWrapper>,
     // 필요 시 추가 가능 (예: pub current_url: String, pub screenshot: Vec<u8>)
 }
 
@@ -199,8 +197,6 @@ pub struct WebAgent<'a, P: PageTrait> {
     // 💡 스텝별 행동 기록을 누적 보관하는 필드 추가
     history: Vec<ActionHistory>,
     max_history_depth: usize, // 토큰 폭발 방지를 위한 최근 기록 유지 개수
-    pub selectors_cache: HashMap<String, SelectorSchema>,
-    last_seen_page_data: Option<ExtractionResult>,
 }
 
 impl<'a, P: PageTrait> WebAgent<'a, P> {
@@ -225,8 +221,6 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             target_description: target_description.to_string(),
             history: Vec::new(),
             max_history_depth: 8, // 기본적으로 최근 8개의 이전 스텝을 저장합니다.
-            last_seen_page_data: None,
-            selectors_cache: HashMap::default(),
         }
     }
 
@@ -234,32 +228,6 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
     pub fn trim_history(&mut self) {
         if self.history.len() > self.max_history_depth {
             self.history.pop();
-        }
-    }
-    /// 페이지 접근 시 먼저 기존 셀렉터로 즉시 추출을 시도하는 메서드
-    pub async fn try_extract_with_cached_selectors(
-        &mut self,
-        route_key: &str, // 예: "list" / "detail"
-    ) -> DynResult<Option<ExtractionResult>> {
-        let Some(selectors) = self.selectors_cache.get(route_key) else {
-            return Ok(None);
-        };
-
-        println!("⚡ [Quick Check] 캐시된 셀렉터로 추출 시도...");
-
-        match self.page.extract_element_info_by_selectors(selectors).await {
-            Ok(result) if !result.data.is_empty() => {
-                println!("✅ [Quick Check] 성공: {:#?}", result);
-                Ok(Some(result))
-            }
-            Ok(_) => {
-                println!("❌ [Quick Check] 추출 결과가 비어 있음");
-                Ok(None)
-            }
-            Err(e) => {
-                println!("❌ [Quick Check] 추출 실패: {}", e);
-                Ok(None)
-            }
         }
     }
 
@@ -319,10 +287,10 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
     }
 
     /// URL을 기준으로 추출된 데이터를 비동기로 JSON 저장
-    pub async fn save_extracted_data(
+    pub async fn save_scraped_data(
         &self,
         current_url: &str,
-        data: &ExtractionResult,
+        data: &ExtractedContentWrapper,
     ) -> DynResult<String> {
         let cleaned_url = current_url
             .trim_start_matches("https://")
@@ -386,9 +354,9 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         let html_content = self.page.content().await?;
 
         // 3. 셀렉터 및 최근 추출 데이터 연동
-        let selectors = self.extract_selectors(&simplified_dom).await?;
+        let selectors = self.ask_important_selectors(&simplified_dom).await?;
         let last_extracted_data =
-            lib::page::extract_data_with_selectors(self.page, &selectors).await?;
+            lib::page::extract_by_selector_schema(self.page, &selectors).await?;
 
         spinner.finish_with_message("Done!\n");
 
@@ -408,10 +376,9 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             println!("\n=== Agent Step {} ===", step);
 
             // 1. Observe: 스텝 시작 시 DOM, simpleified_dom 관측
-            let agent_observation = self.capture_observation().await?;
-
-            println!("📍 현재 위치: {}", agent_observation.current_url);
             println!("📍 현재 위치 (debug): {}", self.page.current_url().await?);
+            let agent_observation = self.capture_observation().await?;
+            println!("📍 현재 위치: {}", agent_observation.current_url);
 
             // 2. 관찰 시점의 Simplified DOM 즉시 저장
             if let Err(e) = self
@@ -426,7 +393,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             // 3. 관찰 시점의 extracted_data가 존재할 때만 안전하게 저장
             if let Some(ref extracted_data) = agent_observation.extracted_data {
                 if let Err(e) = self
-                    .save_extracted_data(&agent_observation.current_url, extracted_data)
+                    .save_scraped_data(&agent_observation.current_url, extracted_data)
                     .await
                 {
                     eprintln!("⚠️ [Run Observation Extracted Data Save Warning] {}", e);
@@ -636,13 +603,16 @@ DO NOT repeat same action 3 times in a row.
             self.history_to_string(),
             obs.current_url
         );
+        let elem = match &obs.focused_selectors {
+            Some(schema) => lib::page::locate_selector_schema_elements(self.page, schema).await?,
+            None => ExtractedContentWrapper {
+                data: ExtractedContent::Single(HashMap::new()), // 또는 ExtractionData::List(Vec::new())
+            },
+        };
 
         let prompt = format!(
-            "Target Goal: {}\n\nCurrent DOM data:\n{}\n\nNow, determine the next action:",
-            self.task_goal,
-            obs.extracted_data
-                .as_ref()
-                .unwrap_or(&ExtractionResult::default())
+            "Target Goal: {}\n\nCurrent DOM elements:\n{}\n\nNow, determine the next action:",
+            self.task_goal, elem
         );
 
         // llm request 포맷 생성
@@ -689,7 +659,7 @@ DO NOT repeat same action 3 times in a row.
     }
 
     /// 간소화된 DOM 트리를 바탕으로 추출에 필요한 CSS Selector 스키마를 LLM으로부터 취득
-    pub async fn extract_selectors(
+    pub async fn ask_important_selectors(
         &self,
         simplified_dom: &str,
     ) -> Result<SelectorSchema, DynError> {
@@ -738,7 +708,7 @@ DO NOT repeat same action 3 times in a row.
 
                     match serde_json::from_str::<SelectorSchema>(&cleaned_json) {
                         Ok(parsed_schema) => {
-                            println!("🥳 Successfully parsed SelectorSchema! These selectors are looking important... {}", parsed_schema);
+                            println!("🥳 Successfully parsed SelectorSchema! These selectors are looking important...\n {}", parsed_schema);
                             return Ok(parsed_schema);
                         }
                         Err(e) => {
