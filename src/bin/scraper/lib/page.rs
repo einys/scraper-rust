@@ -91,7 +91,7 @@ impl ExtractedElementInfo {
 }
 
 /// 최종 JSON 결과 (필드명 -> ExtractedElementInfo)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtractionResult {
     pub data: HashMap<String, ExtractedElementInfo>,
 }

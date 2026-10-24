@@ -1,0 +1,34 @@
+{
+  "data": {
+    "img_src": {
+      "selector": "div[id='masonry'] > div > div > a article > div:last-child > div > div > img",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "content": {
+      "selector": "div[id='masonry'] > div > div > a article > div:first-child > span:nth-child(2)::text",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "updated_at": {
+      "selector": "div[id='masonry'] > div > div > a article > div:first-child > span:nth-child(1)::text",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "username": {
+      "selector": "div[id='masonry'] > div > div > a article > div:first-child > span:nth-child(1)::text",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    },
+    "links_attached": {
+      "selector": "div[id='masonry'] > div > div > a a[href]",
+      "text_content": null,
+      "outer_html": null,
+      "rect": null
+    }
+  }
+}

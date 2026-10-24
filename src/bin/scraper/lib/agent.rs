@@ -12,6 +12,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 
+use crate::lib;
 use crate::lib::dyn_result::DynError;
 use crate::lib::dyn_result::DynResult;
 use crate::lib::page::ExtractionResult;
@@ -99,8 +100,8 @@ pub enum AgentAction {
         reason: String,
     },
     /// DOM에서 원하는 셀렉터 목록으로 데이터를 추출합니다.
-    #[serde(alias = "extract", alias = "extract_data", alias = "Extract")]
-    ExtractData { reasoning: String },
+    // #[serde(alias = "extract", alias = "extract_data", alias = "Extract")]
+    // ExtractData { reasoning: String },
     /// go back to the previous page.
     #[serde(alias = "back", alias = "back_page", alias = "Back")]
     BackPage {
@@ -117,7 +118,7 @@ impl AgentAction {
             AgentAction::ScrollPage { reasoning, .. } => reasoning,
             AgentAction::ClickElement { reasoning, .. } => reasoning,
             AgentAction::Finish { reasoning, .. } => reasoning,
-            AgentAction::ExtractData { reasoning, .. } => reasoning,
+            // AgentAction::ExtractData { reasoning, .. } => reasoning,
             AgentAction::BackPage { reasoning } => reasoning,
         }
     }
@@ -130,7 +131,7 @@ impl AgentAction {
             AgentAction::ScrollPage { .. } => "ScrollPage",
             AgentAction::ClickElement { .. } => "ClickElement",
             AgentAction::Finish { .. } => "Finish",
-            AgentAction::ExtractData { .. } => "ExtractData",
+            // AgentAction::ExtractData { .. } => "ExtractData",
             AgentAction::BackPage { .. } => "BackPage",
         }
     }
@@ -143,59 +144,22 @@ impl AgentAction {
             AgentAction::ScrollPage { dy, .. } => format!("ScrollPage(dy={})", dy),
             AgentAction::ClickElement { selector, .. } => format!("ClickElement({})", selector),
             AgentAction::Finish { reason, .. } => format!("Finish({})", reason),
-            AgentAction::ExtractData { .. } => {
-                format!("ExtractData")
-            }
+            // AgentAction::ExtractData { .. } => {
+            //     format!("ExtractData")
+            // }
             AgentAction::BackPage { .. } => "BackPage".to_string(),
         }
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct AgentObservation {
     pub simplified_dom: String,
     pub html_content: String,
     pub current_url: String,
-    // pub target_selectors: Vec<String>,
-    // pub screenshot: Vec<u8>,
-    // pub extracted_elements: Vec<String>,
+    pub focused_selectors: Option<SelectorSchema>,
+    pub extracted_data: Option<ExtractionResult>,
     // 필요 시 추가 가능 (예: pub current_url: String, pub screenshot: Vec<u8>)
-}
-
-impl AgentObservation {
-    // 추가적인 정보 {simplified_dom, html_content, current_url}를 반환하는 메서드
-    pub async fn capture<P: PageTrait>(page: &P) -> DynResult<Self> {
-        // 1. 새 탭은 에이전트가 다루기 어려우므로 새 탭 열림을 page 관찰 즉시 무력화 (target 속성 제거 & window.open 오버라이딩)
-        let sanitize_js = r#"
-                    (() => {
-                        // target 속성 제거
-                        document.querySelectorAll('a[target]').forEach(el => {
-                            el.removeAttribute('target');
-                        });
-
-                        // window.open 호출 시 현재 창 이동으로 덮어쓰기
-                        window.open = function(url) {
-                            if (url) {
-                                window.location.href = url;
-                            }
-                            return window;
-                        };
-                    })();
-                "#;
-
-        // 오류가 나더라도 관측 자체가 깨지지 않도록 비동기 실행 및 에러 무시 처리
-        let _ = page.evaluate(sanitize_js).await;
-
-        let simplified_dom = crate::lib::page::get_simplified_dom_tree(page).await?;
-        let html_content = page.content().await?;
-        let current_url = page.current_url().await?;
-
-        Ok(Self {
-            // TODO: selector, extracted data 를 여기다 저장하고 프롬프트로 넘기기
-            simplified_dom,
-            html_content,
-            current_url,
-        })
-    }
 }
 
 pub enum LoopControl {
@@ -388,6 +352,55 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
 
         Ok(relative_path_str)
     }
+
+    /// 현재 페이지 상태를 관측하고, 캐시된 셀렉터 및 이전 추출 데이터를 포함한 Observation 생성
+    pub async fn capture_observation(&mut self) -> DynResult<AgentObservation> {
+        let current_url = self.page.current_url().await.unwrap_or_default();
+        println!("👀 Observing current page: {}", current_url);
+        // llm 응답 올 때 까지 스피너
+        let spinner = ProgressBar::new_spinner();
+
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"]),
+        );
+
+        spinner.set_message("Waiting LLM to finish observation...\n");
+        spinner.enable_steady_tick(Duration::from_millis(100));
+
+        // 1. 새 탭 열림 무력화 JS 실행
+        let sanitize_js = r#"
+                (() => {
+                    document.querySelectorAll('a[target]').forEach(el => el.removeAttribute('target'));
+                    window.open = function(url) {
+                        if (url) { window.location.href = url; }
+                        return window;
+                    };
+                })();
+            "#;
+        let _ = self.page.evaluate(sanitize_js).await;
+
+        // 2. Simplified DOM 및 Raw Content 수집
+        let simplified_dom = crate::lib::page::get_simplified_dom_tree(self.page).await?;
+        let html_content = self.page.content().await?;
+
+        // 3. 셀렉터 및 최근 추출 데이터 연동
+        let selectors = self.extract_selectors(&simplified_dom).await?;
+        let last_extracted_data =
+            lib::page::extract_data_with_selectors(self.page, &selectors).await?;
+
+        spinner.finish_with_message("Done!\n");
+
+        Ok(AgentObservation {
+            simplified_dom,
+            html_content,
+            current_url,
+            focused_selectors: Some(selectors),
+            extracted_data: Some(last_extracted_data),
+        })
+    }
+
     /// 메인 루프 실행 메서드
     pub async fn run(&mut self) -> DynResult<()> {
         let mut step = 1;
@@ -395,7 +408,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             println!("\n=== Agent Step {} ===", step);
 
             // 1. Observe: 스텝 시작 시 DOM, simpleified_dom 관측
-            let agent_observation = AgentObservation::capture(self.page).await?;
+            let agent_observation = self.capture_observation().await?;
 
             println!("📍 현재 위치: {}", agent_observation.current_url);
             println!("📍 현재 위치 (debug): {}", self.page.current_url().await?);
@@ -410,8 +423,21 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             {
                 eprintln!("⚠️ [Run Observation DOM Save Warning] {}", e);
             }
+            // 3. 관찰 시점의 extracted_data가 존재할 때만 안전하게 저장
+            if let Some(ref extracted_data) = agent_observation.extracted_data {
+                if let Err(e) = self
+                    .save_extracted_data(&agent_observation.current_url, extracted_data)
+                    .await
+                {
+                    eprintln!("⚠️ [Run Observation Extracted Data Save Warning] {}", e);
+                }
+            } else {
+                eprintln!(
+                    "⚠️ [Run Observation Extracted Data Save Warning] No extracted data found."
+                );
+            }
 
-            // 3. Think: LLM 추론 (최대 3회 재시도)
+            // 4. Think: LLM 추론 (최대 3회 재시도)
             let mut action_result = None;
             for attempt in 1..=3 {
                 match self.ask_step(&agent_observation).await {
@@ -575,7 +601,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             "목록에 포함된 Actions List:\n{}...",
             action_guide.chars().take(200).collect::<String>()
         );
-        println!("History:\n{}", self.history_to_string());
+        println!("History:\n{}", self.history_summary(6));
 
         let system_prompt = format!(
             r###"
@@ -612,8 +638,11 @@ DO NOT repeat same action 3 times in a row.
         );
 
         let prompt = format!(
-            "Target Goal: {}\n\nCurrent DOM State:\n{}\n\nDetermine the next action:",
-            self.task_goal, obs.simplified_dom
+            "Target Goal: {}\n\nCurrent DOM data:\n{}\n\nNow, determine the next action:",
+            self.task_goal,
+            obs.extracted_data
+                .as_ref()
+                .unwrap_or(&ExtractionResult::default())
         );
 
         // llm request 포맷 생성
@@ -637,7 +666,7 @@ DO NOT repeat same action 3 times in a row.
         let llm_response = self.ollama.generate(request).await?;
         let response_text = llm_response.response.trim();
 
-        spinner.finish_with_message("완료!");
+        spinner.finish_with_message("완료!\n");
 
         // llm response 가져옴
         println!("Agent가 생각한 다음 action 초안: {}", response_text);
@@ -679,7 +708,13 @@ DO NOT repeat same action 3 times in a row.
     Output format: Provide only a concise JSON object containing:
     - "container": "topmost card wrapper selector",
     - "fields": JSON object mapping field names to their relative CSS selectors inside the container.
-    IMPORTANT RULES: Prefer SIMPLEST standard CSS selectors. Do not create non-existing selectors. Do NOT select tailwind-style selector(e.g. max-[60px])"#,
+    [CSS Selector Strict Rules]
+    Prefer SIMPLEST standard CSS selectors. Do not create non-existing selectors. Do NOT select tailwind-style selector(e.g. max-[60px])
+    1. ONLY return standard CSS selectors compatible with `document.querySelector`.
+    2. NEVER use non-standard pseudo-elements like `::text`, `::attr(...)`, or `:contains(...)`.
+    3. The `container` selector MUST select the card/item root wrapper element (e.g. `div#masonry > div > div > a`).
+    4. Field selectors must be relative to the container element.
+    "#,
             simplified_dom.trim(),
             self.target_description.trim()
         );
@@ -735,49 +770,48 @@ DO NOT repeat same action 3 times in a row.
         let current_url = &obs.current_url;
 
         match action {
-            AgentAction::ExtractData { .. } => {
-                // 추출 전 기존 데이터는 잊어버리도록 함
-                self.clean_history_data();
+            // AgentAction::ExtractData { .. } => {
+            //     // 추출 전 기존 데이터는 잊어버리도록 함
+            //     self.clean_history_data();
 
-                println!("[Action] 데이터 추출 실행:");
-                let history_formatter =
-                    HistoryFormatter::new("extract", "ExtractData", current_url);
+            //     println!("[Action] 데이터 추출 실행:");
+            //     let history_formatter =
+            //         HistoryFormatter::new("extract", "ExtractData", current_url);
 
-                let (extracted_data, is_cached) =
-                    match self.try_extract_with_cached_selectors(current_url).await {
-                        Ok(Some(data)) => (data, true),
-                        _ => {
-                            let selectors = self.extract_selectors(&obs.simplified_dom).await?;
-                            let data = crate::lib::page::extract_data_with_selectors(
-                                self.page, &selectors,
-                            )
-                            .await?;
-                            self.selectors_cache.insert(current_url.clone(), selectors);
-                            (data, false)
-                        }
-                    };
+            //     let (extracted_data, is_cached) =
+            //         match self.try_extract_with_cached_selectors(current_url).await {
+            //             Ok(Some(data)) => (data, true),
+            //             _ => {
+            //                 let selectors = self.extract_selectors(&obs.simplified_dom).await?;
+            //                 let data = crate::lib::page::extract_data_with_selectors(
+            //                     self.page, &selectors,
+            //                 )
+            //                 .await?;
+            //                 self.selectors_cache.insert(current_url.clone(), selectors);
+            //                 (data, false)
+            //             }
+            //         };
 
-                println!("추출된 데이터: {:?}", extracted_data);
-                // 파일로 저장
-                self.save_extracted_data(current_url, &extracted_data)
-                    .await?;
+            //     println!("추출된 데이터: {:?}", extracted_data);
+            //     // 파일로 저장
+            //     self.save_extracted_data(current_url, &extracted_data)
+            //         .await?;
 
-                self.last_seen_page_data = Some(extracted_data.clone());
+            //     self.last_seen_page_data = Some(extracted_data.clone());
 
-                let status = if is_cached {
-                    "success (cached)"
-                } else {
-                    "success (new)"
-                };
-                let msg = history_formatter.format(
-                    status,
-                    "Data extraction successful",
-                    &extracted_data.to_string(),
-                );
+            //     let status = if is_cached {
+            //         "success (cached)"
+            //     } else {
+            //         "success (new)"
+            //     };
+            //     let msg = history_formatter.format(
+            //         status,
+            //         "Data extraction successful",
+            //         &extracted_data.to_string(),
+            //     );
 
-                Ok((LoopControl::Continue, msg))
-            }
-
+            //     Ok((LoopControl::Continue, msg))
+            // }
             AgentAction::ReadFile { filename, .. } => {
                 // 추출 전 기존 데이터는 잊어버리도록 함
                 self.clean_history_data();
