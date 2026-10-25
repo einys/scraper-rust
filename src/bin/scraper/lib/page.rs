@@ -194,7 +194,7 @@ pub fn sanitize_selector(selector: &str) -> String {
     step4.to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TargetItem {
     pub selector: String,
     pub target_url: Option<String>, // 중복 체크 기준 (href 절대 경로)
@@ -217,37 +217,51 @@ pub async fn fetch_target_items<P: PageTrait>(
             const results = [];
             const visitedSet = new Set();
 
-            for (const [field_name, selector] of Object.entries(schema.fields || {{}})) {{
-                if (!selector) continue;
+            for (const [field_name, raw_selector] of Object.entries(schema.fields || {{}})) {{
+                if (!raw_selector) continue;
                 try {{
-                    const elements = document.querySelectorAll(selector);
+                    const elements = document.querySelectorAll(raw_selector);
                     elements.forEach((el) => {{
-                        const href = el.getAttribute('href') || el.closest('a')?.getAttribute('href');
+                        // 💡 1. 자식 요소(span, img 등)가 선택된 경우 부모 <a> 태그를 찾아 실제 클릭 타겟으로 승격
+                        const anchorEl = el.tagName === 'A' ? el : el.closest('a');
+                        const targetEl = anchorEl || el; // <a> 태그가 없으면 원본 요소 유지
+
                         let target_url = '';
-                        if (href) {{
-                            try {{
-                                target_url = new URL(href, window.location.href).href;
-                            }} catch(e) {{
-                                target_url = href;
+                        if (anchorEl) {{
+                            const href = anchorEl.getAttribute('href');
+                            if (href) {{
+                                try {{
+                                    target_url = new URL(href, window.location.href).href;
+                                }} catch(e) {{
+                                    target_url = href;
+                                }}
                             }}
                         }}
 
-                        const rect = el.getBoundingClientRect();
-                        const key = selector + '|' + target_url + '|' + rect.left + '|' + rect.top;
+                        // 💡 2. 좌표 계산을 승격된 targetEl(실제 <a> 태그)의 bounding box 기준으로 실행
+                        const rect = targetEl.getBoundingClientRect();
 
-                        if (!visitedSet.has(key) && (rect.width > 0 || rect.height > 0 || target_url)) {{
+                        // 화면 밖이거나 크기가 0인 노드 필터링
+                        if (rect.width === 0 && rect.height === 0) return;
+
+                        const key = target_url
+                            ? (target_url + '|' + Math.round(rect.left) + '|' + Math.round(rect.top))
+                            : (raw_selector + '|' + Math.round(rect.left) + '|' + Math.round(rect.top));
+
+                        if (!visitedSet.has(key)) {{
                             visitedSet.add(key);
                             results.push({{
-                                selector: selector,
-                                target_url: target_url,
+                                // anchorEl이 존재하면 'a' 태그 셀렉터 우선 적용
+                                selector: anchorEl ? (raw_selector + " (a)") : raw_selector,
+                                target_url: target_url || null,
                                 center_x: rect.left + rect.width / 2,
                                 center_y: rect.top + rect.height / 2,
-                                text: el.innerText ? el.innerText.trim().slice(0, 100) : ''
+                                text: targetEl.innerText ? targetEl.innerText.trim().slice(0, 100) : ''
                             }});
                         }}
                     }});
                 }} catch(e) {{
-                    console.error('Selector error:', selector, e);
+                    console.error('Selector error:', raw_selector, e);
                 }}
             }}
             return results;
@@ -428,4 +442,66 @@ fn parse_field_value(field_name: &str, element: &ElementRef) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+pub async fn inject_visual_cursor<P: PageTrait>(page: &P) -> DynResult<()> {
+    let js_code = r#"
+    (() => {
+        if (document.getElementById('agent-visual-cursor')) return;
+
+        // 1. 빨간색 마우스 커서 포인터 생성
+        const cursor = document.createElement('div');
+        cursor.id = 'agent-visual-cursor';
+        cursor.style.position = 'fixed';
+        cursor.style.top = '0';
+        cursor.style.left = '0';
+        cursor.style.width = '14px';
+        cursor.style.height = '14px';
+        cursor.style.backgroundColor = 'rgba(255, 0, 0, 0.85)';
+        cursor.style.border = '2px solid white';
+        cursor.style.borderRadius = '50%';
+        cursor.style.pointerEvents = 'none';
+        cursor.style.zIndex = '999999';
+        cursor.style.transition = 'transform 0.1s ease, left 0.05s linear, top 0.05s linear';
+        cursor.style.boxShadow = '0 0 8px rgba(255, 0, 0, 0.8)';
+        document.body.appendChild(cursor);
+
+        // 2. 마우스 이동 이벤트 감지 시 커서 위치 업데이트
+        window.addEventListener('mousemove', (e) => {
+            cursor.style.left = `${e.clientX - 7}px`;
+            cursor.style.top = `${e.clientY - 7}px`;
+        });
+
+        // 3. 클릭 시 핑(Ripple) 이펙트 애니메이션 생성
+        window.addEventListener('click', (e) => {
+            const ripple = document.createElement('div');
+            ripple.style.position = 'fixed';
+            ripple.style.left = `${e.clientX - 15}px`;
+            ripple.style.top = `${e.clientY - 15}px`;
+            ripple.style.width = '30px';
+            ripple.style.height = '30px';
+            ripple.style.border = '3px solid #ff0055';
+            ripple.style.borderRadius = '50%';
+            ripple.style.pointerEvents = 'none';
+            ripple.style.zIndex = '999998';
+            ripple.style.animation = 'agent-ripple 0.5s ease-out forwards';
+            document.body.appendChild(ripple);
+
+            setTimeout(() => ripple.remove(), 500);
+        });
+
+        // 4. Ripple 애니메이션 CSS 주입
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes agent-ripple {
+                0% { transform: scale(0.5); opacity: 1; }
+                100% { transform: scale(2.5); opacity: 0; }
+            }
+        `;
+        document.head.appendChild(style);
+    })();
+    "#;
+
+    page.evaluate(js_code).await?;
+    Ok(())
 }

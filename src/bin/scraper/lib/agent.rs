@@ -4,6 +4,7 @@ use regex::Regex;
 use schemars::schema_for;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -23,27 +24,29 @@ use ollama_rs::Ollama;
 
 use serde_json::Value;
 
+const MAX_HISTORY_COUNT: usize = 12;
+
 /// ActionHistory 출력 규칙을 캡슐화한 헬퍼 구조체
 struct HistoryFormatter<'a> {
     step: &'a str,
     action_name: &'a str,
-    target_url: &'a str,
+    current_url: &'a str,
 }
 
 impl<'a> HistoryFormatter<'a> {
-    fn new(step: &'a str, action_name: &'a str, target_url: &'a str) -> Self {
+    fn new(step: &'a str, action_name: &'a str, current_location_url: &'a str) -> Self {
         Self {
             step,
             action_name,
-            target_url,
+            current_url: current_location_url,
         }
     }
 
     /// ActionHistory 표준 응답 문자열 포맷 생성
     fn format(&self, status: &str, reasoning: &str, data_payload: &str) -> String {
         format!(
-            "ActionHistory {{ step: \"{}\", reasoning: \"{}\", action_name: \"{}\", status: \"{}\", target_url: \"{}\" }} <data>{}</data>",
-            self.step, reasoning, self.action_name, status, self.target_url, data_payload
+            "{{ step: \"{}\", action_name: \"{}\", status: \"{}\", current_url: \"{}\" }} <data>{}</data>",
+            self.step, self.action_name, status, self.current_url, data_payload
         )
     }
 }
@@ -71,7 +74,7 @@ fn default_scroll_dy() -> i32 {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "action", content = "params", rename_all = "PascalCase")]
+#[serde(tag = "action", content = "params")]
 pub enum AgentAction {
     /// 파일을 읽어옵니다.
     #[serde(alias = "read", alias = "read_file", alias = "Read")]
@@ -196,7 +199,32 @@ impl ActionHistory {
     }
 }
 
-use std::collections::HashMap;
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TargetItemWrapper {
+    // 1. 최상위 배열 형태: [ TargetItem, ... ] (가장 직관적)
+    Array(Vec<TargetItem>),
+    // 2. 단일 객체 형태: { "selector": "...", ... }
+    Single(TargetItem),
+}
+
+impl TargetItemWrapper {
+    pub fn into_vec(self) -> Vec<TargetItem> {
+        match self {
+            TargetItemWrapper::Array(arr) => arr,
+            TargetItemWrapper::Single(item) => vec![item],
+        }
+    }
+}
+
+/// URL 중복 체크 시 비교 정확도를 높이기 위한 정규화 헬퍼
+fn normalize_url(url: &str) -> String {
+    url.trim_end_matches('/')
+        .split('#') // 해시 태그 제거
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
 
 pub struct WebAgent<'a, P: PageTrait> {
     ollama: Ollama,
@@ -207,6 +235,8 @@ pub struct WebAgent<'a, P: PageTrait> {
     // 💡 스텝별 행동 기록을 누적 보관하는 필드 추가
     history: Vec<ActionHistory>,
     max_history_depth: usize, // 토큰 폭발 방지를 위한 최근 기록 유지 개수
+    pub visited_urls: HashSet<String>,
+    target_webpage: String,
 }
 
 impl<'a, P: PageTrait> WebAgent<'a, P> {
@@ -218,6 +248,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         page: &'a P,
         system_task_prompt: &str,
         page_element_target_description: &str,
+        target_webpage: &str,
     ) -> Self {
         let ollama = Ollama::builder()
             .host(ollama_host.to_string())
@@ -230,14 +261,28 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             system_task_prompt: system_task_prompt.to_string(),
             page_observation_system_prompt: page_element_target_description.to_string(),
             history: Vec::new(),
-            max_history_depth: 8, // 기본적으로 최근 8개의 이전 스텝을 저장합니다.
+            max_history_depth: MAX_HISTORY_COUNT, // 기본적으로 최근 8개의 이전 스텝을 저장합니다.
+            visited_urls: HashSet::new(),
+            target_webpage: target_webpage.to_string(),
         }
     }
 
-    // 💡 max_history_depth를 고려하여 history를 제한하는 메소드 추가
+    /// URL을 방문 처리할 때 쿼리 파라미터/트레일링 슬래시 정규화 후 저장
+    pub fn mark_visited(&mut self, url: &str) {
+        let normalized = normalize_url(url);
+        self.visited_urls.insert(normalized);
+    }
+
+    pub fn is_visited(&self, url: &str) -> bool {
+        let normalized = normalize_url(url);
+        self.visited_urls.contains(&normalized)
+    }
+
+    // 💡 max_history_depth를 고려하여 오래된 history부터 제거하는 메소드 (FIFO 형식)
     pub fn trim_history(&mut self) {
         if self.history.len() > self.max_history_depth {
-            self.history.pop();
+            let overflow = self.history.len() - self.max_history_depth;
+            self.history.drain(0..overflow);
         }
     }
 
@@ -361,19 +406,17 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         let _ = self.page.evaluate(sanitize_js).await;
 
         // 2. 초기 Simplified DOM 캡처
-        let mut simplified_dom = crate::lib::page::get_simplified_dom_tree(self.page).await?;
+        let simplified_dom = crate::lib::page::get_simplified_dom_tree(self.page).await?;
         let html_content = self.page.content().await?;
 
         // 3. 셀렉터 추출 및 타겟 항목 수집
-        let mut selectors = self.ask_important_selectors(&simplified_dom).await?;
-        let mut target_elements = lib::page::fetch_target_items(self.page, &selectors).await?;
+        let selectors = self.ask_important_selectors(&simplified_dom).await?;
+        let target_elements = lib::page::fetch_target_items(self.page, &selectors).await?;
 
         // if target elements are emprty, print error
         if target_elements.is_empty() {
             println!("⚠️ Warning: No target elements found.");
         }
-
-        // 4. 타겟
 
         spinner.finish_with_message("Done!\n");
 
@@ -399,7 +442,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         println!("🧹 [Memory Clean] 히스토리 내 <data> 태그 영역 제거 완료 (액션 기록만 유지)");
     }
 
-    /// schemars로 만든 스키마를 LLM 전달용으로 축소
+    /// schemars 스키마 기반 Action 가이드 생성 (Nested params 구조 대응)
     fn build_compact_action_guide(&self) -> String {
         let full_schema = schema_for!(AgentAction);
         let schema_val = serde_json::to_value(&full_schema).unwrap_or_default();
@@ -413,30 +456,53 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                if let Some(props) = item.get("properties") {
-                    let action_name = props
-                        .get("action")
-                        .and_then(|a| a.get("enum"))
-                        .and_then(|e| e.get(0))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown");
+                if let Some(props) = item.get("properties").and_then(|p| p.as_object()) {
+                    let mut action_name = None;
 
-                    let mut params_fields = Vec::new();
-                    if let Some(params_obj) = props.get("params").and_then(|p| p.get("properties"))
+                    // 1. enum/const 속성을 찾아 액션 이름을 자동 추출
+                    for (_key, val) in props {
+                        if let Some(enum_val) = val
+                            .get("enum")
+                            .and_then(|e| e.get(0))
+                            .and_then(|v| v.as_str())
+                        {
+                            action_name = Some(enum_val.to_string());
+                            break;
+                        }
+                        if let Some(const_val) = val.get("const").and_then(|v| v.as_str()) {
+                            action_name = Some(const_val.to_string());
+                            break;
+                        }
+                    }
+
+                    let action_name_str = action_name.as_deref().unwrap_or("Unknown");
+
+                    // 2. nested된 "params" 객체 내부의 실제 파라미터 필드 수집
+                    let mut param_fields = Vec::new();
+                    if let Some(params_obj) = props
+                        .get("params")
+                        .or_else(|| props.get("Params"))
+                        .and_then(|p| p.get("properties"))
+                        .and_then(|p| p.as_object())
                     {
-                        if let Some(map) = params_obj.as_object() {
-                            for (field, _) in map {
-                                params_fields.push(field.as_str());
+                        for (field, _) in params_obj {
+                            param_fields.push(field.as_str());
+                        }
+                    } else {
+                        // 만약 params 속성이 없는 단일 필드 variant일 경우 (Fallback)
+                        for (k, _) in props {
+                            if k != "action" && k != "action_name" && k != "Params" && k != "params"
+                            {
+                                param_fields.push(k.as_str());
                             }
                         }
                     }
 
-                    // 축약된 형태 생성: - ActionName: 설명 (required params: field1, field2)
                     compact_docs.push_str(&format!(
-                        "- Action: `{}`\n  Description: {}\n  Params: {}\n\n",
-                        action_name,
+                        "- action: `{}`\n  description: {}\n  params: {}\n\n",
+                        action_name_str,
                         description,
-                        serde_json::to_string(&params_fields).unwrap_or_default()
+                        serde_json::to_string(&param_fields).unwrap_or_default()
                     ));
                 }
             }
@@ -454,24 +520,24 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
     }
 
     /// 프롬프트 전달용: <data>...</data> 영역이 제거된 히스토리 요약 문자열 반환
-    pub fn history_summary(&self, limit: usize) -> String {
-        let re = Regex::new(r"(?s)\s*<data>.*?</data>").unwrap();
+    // pub fn history_summary(&self, limit: usize) -> String {
+    //     let re = Regex::new(r"(?s)\s*<data>.*?</data>").unwrap();
 
-        self.history
-            .iter()
-            .rev()
-            .take(limit)
-            .rev()
-            .map(|h| {
-                let cleaned_status = re.replace_all(&h.status, "").trim().to_string();
-                format!(
-                    "Step {}: Action='{}' | Status='{}'",
-                    h.step, h.action_name, cleaned_status
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
+    //     self.history
+    //         .iter()
+    //         .rev()
+    //         .take(limit)
+    //         .rev()
+    //         .map(|h| {
+    //             let cleaned_status = re.replace_all(&h.status, "").trim().to_string();
+    //             format!(
+    //                 "Step {}: Action='{}' | Status='{}'",
+    //                 h.step, h.action_name, cleaned_status
+    //             )
+    //         })
+    //         .collect::<Vec<_>>()
+    //         .join("\n")
+    // }
 
     /// LLM에 다음 단계를 추론하도록 요청하는 헬퍼 메서드
     async fn ask_step(&self, obs: &AgentObservation) -> DynResult<AgentAction> {
@@ -482,32 +548,35 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             "목록에 포함된 Actions List:\n{}...",
             action_guide.chars().take(200).collect::<String>()
         );
-        println!("History:\n{}", self.history_summary(6));
+        println!("History:\n{}", self.history_to_string());
+        println!("Visited Urls:\n{:?}", self.visited_urls);
 
         // system prompt build
         let system_prompt = format!(
             r###"
+
+                You are an automated web agent and data extraction engine.
+
                 [Target Goal]
                 {}
+
+                [Rules]
                 Before choosing an action, you MUST explain your rationale in detail within the 'reasoning' field.
-                Respond ONLY with a valid JSON object matching one of the schemas below. Do NOT include any extra text or Markdown formatting.
+                Respond ONLY with valid JSON. Do NOT use markdown code blocks or any extra text.
 
                 [Strictly Allowed Actions Schema]
+                'reasoning' field is mandatory for all actions.
                 {}
 
-
                 [Response Format]
-                Respond with a SINGLE JSON object matching this exact shape:
+                SINGLE JSON object matching this exact nested json shape:
                 {{
-                  "action": "<ActionName>",
+                  "action": "<Action>",
                   "params": {{
-                    "reasoning": "<Why you chose this action>",
-                    ... <other action parameters>
+                      "reasoning": "<Why you chose this action>",
+                      ... <other exact action parameters 100% matching to schema>
+                    }}
                   }}
-                }}
-
-                Do NOT wrap response in markdown code blocks. Do NOT output extra text.
-                DO NOT repeat same action 3 times in a row.
             "###,
             self.system_task_prompt, action_guide,
         );
@@ -518,12 +587,14 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             None => Vec::new(),
         };
 
-        let elem_json =
-            serde_json::to_string_pretty(&elem).unwrap_or_else(|_| format!("{:#?}", elem));
+        let focused_elem = self.focus_to_some_items(elem, 8).await?;
+
+        let focused_elem_json = serde_json::to_string_pretty(&focused_elem)
+            .unwrap_or_else(|_| format!("{:#?}", focused_elem));
 
         println!(
             "🔎 [DOM Elements Preview]:\n{}",
-            elem_json.chars().take(500).collect::<String>()
+            focused_elem_json.chars().take(500).collect::<String>()
         );
 
         let current_user_prompt = format!(
@@ -537,10 +608,11 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             [Current DOM elements]
             {}
 
-            Choose the next Action in JSON.",
+
+            Choose the next Action schema in JSON.",
             self.history_to_string(),
             obs.current_url,
-            elem_json
+            focused_elem_json,
         );
 
         // llm request 포맷 생성
@@ -576,12 +648,12 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         println!("\n🧠 [Agent Thinking]: {}", action.reasoning());
         println!("\n🏃 [Agent Action]: {:?}", action);
 
-        println!("Enter를 누르면 계속 진행합니다...");
+        // println!("Enter를 누르면 계속 진행합니다...");
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+        // let mut input = String::new();
+        // io::stdin().read_line(&mut input).unwrap();
 
-        println!("계속 진행합니다!");
+        // println!("계속 진행합니다!");
 
         Ok(action)
     }
@@ -608,18 +680,19 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 ... <field selectors, necessary for the Task>
               }}
             }}
-            [CSS Selector Strict Rules]
-            - Keep selectors as concise and clean as possible, while ensuring each selector uniquely identifies its target item without ambiguity.
-               - ONLY return standard CSS selectors compatible with `document.querySelector`.
-               - NEVER use non-standard pseudo-elements (`::text`, `::attr(...)`, `:contains(...)`).
-               - DO NOT use Tailwind style classes (e.g., `max-[60px]`).
+            [CSS Selector Rules]
+            - Keep selectors as short and clean as possible, while ensuring each selector uniquely identifies its target item without ambiguity.
+            - Prefer direct class/id or short structural jumps (e.g., `article a`, `a.group`, `.thumbnail-wrapper img`).
+            - ONLY return standard CSS selectors compatible with `document.querySelector`.
+            - NEVER use non-standard pseudo-elements (`::text`, `::attr(...)`, `:contains(...)`).
+            - DO NOT use Tailwind style classes (e.g., `max-[60px]`).
             "#,
             self.page_observation_system_prompt.trim()
         );
 
         let user_prompt = format!(
             r#"
-            Below is a simplified, REPRESENTATIVE HTML DOM tree:
+            HTML DOM tree:
                 ---
                 {}
                 ---
@@ -651,6 +724,133 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         }
 
         Ok(parsed_schema)
+    }
+
+    // selector로 선택된 Targetitems 의 목록이 너무 길면 llm이 환각을 일으키므로 5~6개 정도의 후보군으로 줄여주는 메서드
+    pub async fn focus_to_some_items(
+        &self,
+        items: Vec<TargetItem>,
+        max_items: usize,
+    ) -> DynResult<Vec<TargetItem>> {
+        if items.len() <= max_items {
+            return Ok(items);
+        }
+
+        println!(
+            "🟠 Focusing to {} items from {} items...",
+            max_items,
+            items.len(),
+        );
+
+        // 1. 유효 좌표(화면 내부)를 가진 항목만 1차 좌표 샌드박싱
+        let valid_items: Vec<TargetItem> = items
+            .iter()
+            .filter(|item| item.center_x > 1.0 && item.center_y > 1.0)
+            .cloned()
+            .collect();
+
+        if valid_items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 방문한 적 있는 item제외하는 2차 필터
+        // 1. 유효 좌표 및 중복 방문 URL 제거 (코드 레벨 1차 필터링)
+        let valid_unvisited_items: Vec<TargetItem> = valid_items
+            .into_iter()
+            .filter(|item| {
+                // 좌표 검증
+                let is_valid_coord = item.center_x > 1.0 && item.center_y > 1.0;
+
+                // URL 방문 여부 검증
+                let is_not_visited = match &item.target_url {
+                    Some(url) => !self.is_visited(url),
+                    None => true, // URL 정보가 없으면 유지
+                };
+
+                is_valid_coord && is_not_visited
+            })
+            .take(30) // 최대 30개만 프롬프트에 입력!
+            .collect();
+
+        if valid_unvisited_items.len() <= max_items {
+            return Ok(valid_unvisited_items);
+        }
+
+        let items_json = serde_json::to_string_pretty(&valid_unvisited_items)
+            .unwrap_or_else(|_| format!("{:#?}", valid_unvisited_items));
+
+        let system_prompt = "You are a DOM observation item filtering engine.";
+
+        let prompt = format!(
+            r"#
+            [Goal]
+            {}
+
+            [Action History]
+            {}
+
+
+            [Current DOM Observation Elements]
+            {}
+
+
+            For the Goal, Action History, Current DOM Observation Elements, which elements are interesting or important for the next probable action? Summarize it in max. 300 tokens.
+            #",
+            self.system_task_prompt,
+            self.history_to_string(),
+            items_json
+        );
+
+        // 3. LLM 호출
+        let request = GenerationRequest::new(self.model.clone(), prompt)
+            .system(system_prompt)
+            .format(FormatType::Json);
+
+        // llm 응답 올 때 까지 스피너
+        let spinner = ProgressBar::new_spinner();
+
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"]),
+        );
+
+        spinner.set_message("LLM 응답 대기 중");
+        spinner.enable_steady_tick(Duration::from_millis(100));
+
+        let response = match self.ollama.generate(request).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                println!("⚠️ [Focus LLM Error] LLM 필터링 실패, Fallback 적용: {}", e);
+                return Ok(valid_unvisited_items.into_iter().take(max_items).collect());
+            }
+        };
+
+        spinner.finish_with_message("완료!\n");
+
+        // 4. 응답 파싱 및 안전 Fallback
+        let cleaned_json = lib::page::parse_json_from_llm_response(response.response.trim());
+
+        println!(
+            "🎯 [Selector Focus Engine] LLM 응답 파싱 완료: {}",
+            cleaned_json
+        );
+
+        let items_vec = serde_json::from_str::<TargetItemWrapper>(&cleaned_json)
+            .map(|parsed| parsed.into_vec())
+            .unwrap_or_default();
+
+        if !items_vec.is_empty() {
+            println!(
+                "🎯 [Selector Focus Engine] 처음 {}개 중 최종 {}개 유효 요소를 선택함",
+                items.len(),
+                items_vec.len()
+            );
+            Ok(items_vec.into_iter().take(max_items).collect())
+        } else {
+            println!("⚠️ [Focus LLM Warning] LLM 응답 파싱 실패 또는 빈 배열. 유효 Fallback 적용.");
+            Ok(valid_unvisited_items.into_iter().take(max_items).collect())
+        }
     }
 
     /// 결정된 Action을 수행하는 헬퍼 메서드 (Tool Calling과 비슷함)
@@ -910,9 +1110,17 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             println!("\n=== Agent Step {} ===", step);
 
             // 1. Observe: 스텝 시작 시 DOM, simpleified_dom 관측
-            println!("📍 현재 위치 (debug): {}", self.page.current_url().await?);
+            // println!("📍 현재 위치 (debug): {}", self.page.current_url().await?);
+
             let agent_observation = self.capture_observation().await?;
-            println!("📍 현재 위치: {}", agent_observation.current_url);
+            let current_url = &agent_observation.current_url;
+            println!("📍 current url: {}", current_url);
+            self.mark_visited(&current_url);
+            if self.visited_urls.len() >= 50 {
+                println!("✅ [Visited Urls] Length: {}", self.visited_urls.len());
+                println!("Exiting due to visited urls length 50");
+                break;
+            }
 
             // 2. 관찰 시점의 Simplified DOM 즉시 저장
             if let Err(e) = self

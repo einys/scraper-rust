@@ -8,6 +8,15 @@ use futures::StreamExt; // tokio_stream 대신 이것 하나로 통합
 
 use async_trait::async_trait;
 
+// 로그에 현재시간 기록
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        std::println!("[{}] {}", now, format_args!($($arg)*));
+    }};
+}
+
 #[path = "lib/lib.rs"]
 mod lib;
 
@@ -106,12 +115,6 @@ impl PageTrait for ChromiumPageAdapter {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let point = Point { x, y };
 
-        // 1. 해당 좌표가 화면 중앙에 오도록 스크롤 (원활한 타격 보장)
-        let scroll_js = format!(
-            "window.scrollTo({{ left: {}, top: {}, behavior: 'instant' }});",
-            (x - 200.0).max(0.0),
-            (y - 200.0).max(0.0)
-        );
         let _ = self.page.evaluate(scroll_js).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -183,14 +186,14 @@ async fn main() -> DynResult<()> {
     let llm_host = "http://localhost";
     let llm_port = 31434;
     let llm_model = "qwen2.5:14b";
-    let system_prompt = format!("Run only maximum 120 Steps. You are an automated web agent and data extraction assistant.
-        Only from {} domain, crawl item pages. You navigate into each item detail routes (['i/id']), and then, **route back to the list**.
+    let system_prompt = format!("Run only maximum 150 Steps. You are an automated web agent and data extraction assistant.
+        Only from {} domain, crawl item pages. You navigate into each item detail routes, and then, **route back to the list**.
         If you are hitting same target_url for more than 3 steps, go back and navigate other pages.
         If you have no interesting html selector in the page, go back page.
         [CRITICAL INSTRUCTION]
-        -Never click external domain url. Only stuck into 'cmsn.info' domain.
-        -You MUST answer ALL queries EXCLUSIVELY in English.", target_webpage);
-    let page_observation_system_prompt = "focus to href and links";
+        -Never click external domain url. Only stuck into {} domain.
+        -You MUST answer ALL queries EXCLUSIVELY in English.", target_webpage, target_webpage);
+    let page_observation_system_prompt = "navigate item href and links";
     // mut 키워드 사용
     let mut agent = WebAgent::new(
         llm_host,
@@ -199,6 +202,7 @@ async fn main() -> DynResult<()> {
         &page_adapter,
         &system_prompt,
         page_observation_system_prompt,
+        target_webpage,
     );
 
     // 실행
