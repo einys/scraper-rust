@@ -1,5 +1,9 @@
+use std::time::Duration;
+
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::input::MouseButton;
 use chromiumoxide::handler::viewport::Viewport;
+use chromiumoxide::layout::Point;
 use futures::StreamExt; // tokio_stream 대신 이것 하나로 통합
 
 use async_trait::async_trait;
@@ -93,6 +97,33 @@ impl PageTrait for ChromiumPageAdapter {
             .map_err(Box::new)?;
         Ok(png_data)
     }
+
+    /// 지정한 (x, y) 좌표로 실제 하드웨어 마우스 커서를 이동하고 클릭을 수행합니다.
+    async fn click_at_point(
+        &self,
+        x: f64,
+        y: f64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let point = Point { x, y };
+
+        // 1. 해당 좌표가 화면 중앙에 오도록 스크롤 (원활한 타격 보장)
+        let scroll_js = format!(
+            "window.scrollTo({{ left: {}, top: {}, behavior: 'instant' }});",
+            (x - 200.0).max(0.0),
+            (y - 200.0).max(0.0)
+        );
+        let _ = self.page.evaluate(scroll_js).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 클릭
+        self.page.click(point).await?;
+
+        println!(
+            "🖱️ [Hardware Mouse Click] Successfully clicked at ({:.2}, {:.2})",
+            x, y
+        );
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -140,31 +171,34 @@ async fn main() -> DynResult<()> {
     // 4. 새 페이지 생성 및 이동 테스트
     // https://www.coupang.com/np/campaigns/82
     // https://www.google.com/shopping?udm=28
-    let page = browser.new_page("https://cmsn.info").await?;
+    let target_webpage = "https://cmsn.info";
+    let page = browser.new_page(target_webpage).await?;
     page.wait_for_navigation().await?;
-
-    // Simulate scrolling
-    // for _ in 0..3 {
-    //     page.evaluate("window.scrollBy(0, 1500);").await?;
-    //     tokio::time::sleep(Duration::from_secs(2)).await;
-    // }
 
     // Get final dom html
     let _html_content = page.content().await?;
     let page_adapter = ChromiumPageAdapter { page: page };
 
-    let _target_description = r#"
-        Important Prompt: From the list of items, extract exactly these fields: content(item 상세 내용, description), username, img_src, links_attached"#;
-
     // Goal prompt
+    let llm_host = "http://localhost";
+    let llm_port = 31434;
+    let llm_model = "qwen2.5:14b";
+    let system_prompt = format!("Run only maximum 120 Steps. You are an automated web agent and data extraction assistant.
+        Only from {} domain, crawl item pages. You navigate into each item detail routes (['i/id']), and then, **route back to the list**.
+        If you are hitting same target_url for more than 3 steps, go back and navigate other pages.
+        If you have no interesting html selector in the page, go back page.
+        [CRITICAL INSTRUCTION]
+        -Never click external domain url. Only stuck into 'cmsn.info' domain.
+        -You MUST answer ALL queries EXCLUSIVELY in English.", target_webpage);
+    let page_observation_system_prompt = "focus to href and links";
     // mut 키워드 사용
     let mut agent = WebAgent::new(
-        "http://localhost",
-        31434,
-        "qwen2.5:14b",
+        llm_host,
+        llm_port,
+        llm_model,
         &page_adapter,
-        "from 'cmsn.info' domain, collect 50 items and details in 'item_details.json' file. Navigate into each item's detail page (`/i/[id]`) to gather complete content. CRITICAL INSTRUCTION: You MUST answer ALL queries EXCLUSIVELY in English.",
-        "href",
+        &system_prompt,
+        page_observation_system_prompt,
     );
 
     // 실행

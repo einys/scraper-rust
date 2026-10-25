@@ -15,6 +15,7 @@ use crate::lib::dyn_result::DynResult;
 use crate::lib::page::ExtractedContent;
 use crate::lib::page::ExtractedContentWrapper;
 use crate::lib::page::SelectorSchema;
+use crate::lib::page::TargetItem;
 use crate::PageTrait;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ollama_rs::generation::parameters::FormatType;
@@ -65,6 +66,10 @@ where
     }
 }
 
+fn default_scroll_dy() -> i32 {
+    1000
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", content = "params", rename_all = "PascalCase")]
 pub enum AgentAction {
@@ -82,14 +87,19 @@ pub enum AgentAction {
     #[serde(alias = "scroll", alias = "scroll_page", alias = "Scroll")]
     ScrollPage {
         reasoning: String, // 👈 생각 과정 추가
-        #[serde(deserialize_with = "deserialize_number_from_string")] // 👈 "1000"과 1000 모두 수용
+        #[serde(
+            default = "default_scroll_dy",
+            deserialize_with = "deserialize_number_from_string"
+        )]
         dy: i32,
     },
     /// 특정 CSS 셀렉터 요소를 클릭합니다.
     #[serde(alias = "click", alias = "click_element", alias = "Click")]
     ClickElement {
-        reasoning: String, // 👈 생각 과정 추가
+        reasoning: String,
         selector: String,
+        x: Option<f64>,
+        y: Option<f64>,
     },
     /// 모든 수집 목표를 완료하고 에이전트를 종료합니다.
     #[serde(alias = "finish", alias = "finish_agent", alias = "Finish")]
@@ -156,7 +166,7 @@ pub struct AgentObservation {
     pub html_content: String,
     pub current_url: String,
     pub focused_selectors: Option<SelectorSchema>,
-    pub extracted_data: Option<ExtractedContentWrapper>,
+    pub target_elements: Vec<TargetItem>,
     // 필요 시 추가 가능 (예: pub current_url: String, pub screenshot: Vec<u8>)
 }
 
@@ -192,8 +202,8 @@ pub struct WebAgent<'a, P: PageTrait> {
     ollama: Ollama,
     model: String,
     page: &'a P,
-    task_goal: String,
-    target_description: String,
+    system_task_prompt: String,
+    page_observation_system_prompt: String,
     // 💡 스텝별 행동 기록을 누적 보관하는 필드 추가
     history: Vec<ActionHistory>,
     max_history_depth: usize, // 토큰 폭발 방지를 위한 최근 기록 유지 개수
@@ -206,8 +216,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         ollama_port: u16,
         model: &str,
         page: &'a P,
-        task_goal: &str,
-        target_description: &str,
+        system_task_prompt: &str,
+        page_element_target_description: &str,
     ) -> Self {
         let ollama = Ollama::builder()
             .host(ollama_host.to_string())
@@ -217,8 +227,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             ollama,
             model: model.to_string(),
             page,
-            task_goal: task_goal.to_string(),
-            target_description: target_description.to_string(),
+            system_task_prompt: system_task_prompt.to_string(),
+            page_observation_system_prompt: page_element_target_description.to_string(),
             history: Vec::new(),
             max_history_depth: 8, // 기본적으로 최근 8개의 이전 스텝을 저장합니다.
         }
@@ -321,21 +331,22 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         Ok(relative_path_str)
     }
 
-    /// 현재 페이지 상태를 관측하고, 캐시된 셀렉터 및 이전 추출 데이터를 포함한 Observation 생성
+    /// 현재 페이지 상태를 관측하고, 최신 DOM 기반으로 Selector 및 Target Items 캡처
     pub async fn capture_observation(&mut self) -> DynResult<AgentObservation> {
         let current_url = self.page.current_url().await.unwrap_or_default();
         println!("👀 Observing current page: {}", current_url);
-        // llm 응답 올 때 까지 스피너
-        let spinner = ProgressBar::new_spinner();
 
+        let spinner = ProgressBar::new_spinner();
         spinner.set_style(
             ProgressStyle::with_template("{spinner:.cyan} {msg}")
                 .unwrap()
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"]),
         );
-
         spinner.set_message("Waiting LLM to finish observation...\n");
         spinner.enable_steady_tick(Duration::from_millis(100));
+
+        // 💡 SPA/비동기 DOM 렌더링 완성 대기
+        tokio::time::sleep(Duration::from_millis(1000)).await;
 
         // 1. 새 탭 열림 무력화 JS 실행
         let sanitize_js = r#"
@@ -349,14 +360,20 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             "#;
         let _ = self.page.evaluate(sanitize_js).await;
 
-        // 2. Simplified DOM 및 Raw Content 수집
-        let simplified_dom = crate::lib::page::get_simplified_dom_tree(self.page).await?;
+        // 2. 초기 Simplified DOM 캡처
+        let mut simplified_dom = crate::lib::page::get_simplified_dom_tree(self.page).await?;
         let html_content = self.page.content().await?;
 
-        // 3. 셀렉터 및 최근 추출 데이터 연동
-        let selectors = self.ask_important_selectors(&simplified_dom).await?;
-        let last_extracted_data =
-            lib::page::extract_by_selector_schema(self.page, &selectors).await?;
+        // 3. 셀렉터 추출 및 타겟 항목 수집
+        let mut selectors = self.ask_important_selectors(&simplified_dom).await?;
+        let mut target_elements = lib::page::fetch_target_items(self.page, &selectors).await?;
+
+        // if target elements are emprty, print error
+        if target_elements.is_empty() {
+            println!("⚠️ Warning: No target elements found.");
+        }
+
+        // 4. 타겟
 
         spinner.finish_with_message("Done!\n");
 
@@ -365,111 +382,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             html_content,
             current_url,
             focused_selectors: Some(selectors),
-            extracted_data: Some(last_extracted_data),
+            target_elements,
         })
-    }
-
-    /// 메인 루프 실행 메서드
-    pub async fn run(&mut self) -> DynResult<()> {
-        let mut step = 1;
-        loop {
-            println!("\n=== Agent Step {} ===", step);
-
-            // 1. Observe: 스텝 시작 시 DOM, simpleified_dom 관측
-            println!("📍 현재 위치 (debug): {}", self.page.current_url().await?);
-            let agent_observation = self.capture_observation().await?;
-            println!("📍 현재 위치: {}", agent_observation.current_url);
-
-            // 2. 관찰 시점의 Simplified DOM 즉시 저장
-            if let Err(e) = self
-                .save_simplified_dom(
-                    &agent_observation.current_url,
-                    &agent_observation.simplified_dom,
-                )
-                .await
-            {
-                eprintln!("⚠️ [Run Observation DOM Save Warning] {}", e);
-            }
-            // 3. 관찰 시점의 extracted_data가 존재할 때만 안전하게 저장
-            if let Some(ref extracted_data) = agent_observation.extracted_data {
-                if let Err(e) = self
-                    .save_scraped_data(&agent_observation.current_url, extracted_data)
-                    .await
-                {
-                    eprintln!("⚠️ [Run Observation Extracted Data Save Warning] {}", e);
-                }
-            } else {
-                eprintln!(
-                    "⚠️ [Run Observation Extracted Data Save Warning] No extracted data found."
-                );
-            }
-
-            // 4. Think: LLM 추론 (최대 3회 재시도)
-            let mut action_result = None;
-            for attempt in 1..=3 {
-                match self.ask_step(&agent_observation).await {
-                    Ok(action) => {
-                        action_result = Some(action);
-                        break;
-                    }
-                    Err(e) => {
-                        println!("LLM 요청 실패 ({}/3): {}", attempt, e);
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-            }
-
-            let action = match action_result {
-                Some(act) => act,
-                None => {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "LLM 요청 3회 연속 실패",
-                    )));
-                }
-            };
-
-            // 소유권 이동 전, 히스토리에 기록할 정보를 미리 준비하거나 참조(&action)로 전달
-            let action_name = action.name().to_string();
-            let reasoning = action.reasoning().to_string();
-
-            // 3. Act: 행동 수행 및 결과 메시지 수집
-            let (control, result_summary) =
-                match self.handle_action(&action, &agent_observation).await {
-                    Ok(res) => res,
-                    Err(e) => (
-                        LoopControl::Continue,
-                        format!("Critical action execution error: {}", e),
-                    ),
-                };
-
-            // Extract data from result_summary if it exists
-            let data = if result_summary.contains("Data: ") {
-                Some(result_summary.split("Data: ").nth(1).unwrap().to_string())
-            } else {
-                None
-            };
-
-            // 4. Record: 행동 명칭, 이유, 실행 결과를 히스토리에 기록
-            let history_entry = ActionHistory {
-                step,
-                action_name,
-                reasoning,
-                status: result_summary,
-                data,
-            };
-            self.history.push(history_entry);
-            self.trim_history();
-
-            // 5. Termination Check: 작업 종료 판단
-            if matches!(control, LoopControl::Finish) {
-                println!("에이전트 작업을 성공적으로 마쳤습니다.");
-                break;
-            }
-
-            step += 1;
-        }
-        Ok(())
     }
 
     // 히스토리에서 <Data></Data> 패턴을 모두 삭제하고 action 기록만 남깁니다.
@@ -570,53 +484,67 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         );
         println!("History:\n{}", self.history_summary(6));
 
+        // system prompt build
         let system_prompt = format!(
             r###"
-You are an automated web agent and data extraction assistant.
-Before choosing an action, you MUST explain your rationale in detail within the 'reasoning' field.
-Respond ONLY with a valid JSON object matching one of the schemas below. Do NOT include any extra text or Markdown formatting.
+                [Target Goal]
+                {}
+                Before choosing an action, you MUST explain your rationale in detail within the 'reasoning' field.
+                Respond ONLY with a valid JSON object matching one of the schemas below. Do NOT include any extra text or Markdown formatting.
 
-[Strictly Allowed Actions Schema]
-{}
+                [Strictly Allowed Actions Schema]
+                {}
 
 
-[Response Format]
-Respond with a SINGLE JSON object matching this exact shape:
-{{
-  "action": "<ActionName>",
-  "params": {{
-    "reasoning": "<Why you chose this action>",
-    ... <other action parameters>
-  }}
-}}
+                [Response Format]
+                Respond with a SINGLE JSON object matching this exact shape:
+                {{
+                  "action": "<ActionName>",
+                  "params": {{
+                    "reasoning": "<Why you chose this action>",
+                    ... <other action parameters>
+                  }}
+                }}
 
-Do NOT wrap response in markdown code blocks. Do NOT output extra text.
-DO NOT repeat same action 3 times in a row.
-
-[Your Action History]
-{}
-
-[Your Current Route Location]
-{}
-"###,
-            action_guide,
-            self.history_to_string(),
-            obs.current_url
+                Do NOT wrap response in markdown code blocks. Do NOT output extra text.
+                DO NOT repeat same action 3 times in a row.
+            "###,
+            self.system_task_prompt, action_guide,
         );
+
+        // user prompt (current state prompt) build
         let elem = match &obs.focused_selectors {
-            Some(schema) => lib::page::locate_selector_schema_elements(self.page, schema).await?,
-            None => ExtractedContentWrapper {
-                data: ExtractedContent::Single(HashMap::new()), // 또는 ExtractionData::List(Vec::new())
-            },
+            Some(schema) => lib::page::fetch_target_items(self.page, schema).await?,
+            None => Vec::new(),
         };
 
-        let prompt = format!(
-            "Target Goal: {}\n\nCurrent DOM elements:\n{}\n\nNow, determine the next action:",
-            self.task_goal, elem
+        let elem_json =
+            serde_json::to_string_pretty(&elem).unwrap_or_else(|_| format!("{:#?}", elem));
+
+        println!(
+            "🔎 [DOM Elements Preview]:\n{}",
+            elem_json.chars().take(500).collect::<String>()
+        );
+
+        let current_user_prompt = format!(
+            "
+            [Your Action History] (Recent)
+            {}
+
+            [Your Current Route Location]
+            {}
+
+            [Current DOM elements]
+            {}
+
+            Choose the next Action in JSON.",
+            self.history_to_string(),
+            obs.current_url,
+            elem_json
         );
 
         // llm request 포맷 생성
-        let request = GenerationRequest::new(self.model.clone(), prompt)
+        let request = GenerationRequest::new(self.model.clone(), current_user_prompt)
             .system(system_prompt.to_string())
             .format(FormatType::Json);
 
@@ -664,71 +592,65 @@ DO NOT repeat same action 3 times in a row.
         simplified_dom: &str,
     ) -> Result<SelectorSchema, DynError> {
         println!(
-            "🪐 [Selector Extractor] LLM Loading... feed: simplified_dom length: {}",
+            "🪐 [Selector Extractor] LLM Loading... simplified_dom length: {}",
             simplified_dom.len()
         );
 
         // CSS selector prompt
-        let prompt = format!(
-            r#"Below is a simplified, REPRESENTATIVE HTML DOM tree:
-    ---
-    {}
-    ---
-    Task: Find the CSS Selectors to extract a list of items for: "{}"
-    Output format: Provide only a concise JSON object containing:
-    - "container": "topmost card wrapper selector",
-    - "fields": JSON object mapping field names to their relative CSS selectors inside the container.
-    [CSS Selector Strict Rules]
-    Prefer SIMPLEST standard CSS selectors. Do not create non-existing selectors. Do NOT select tailwind-style selector(e.g. max-[60px])
-    1. ONLY return standard CSS selectors compatible with `document.querySelector`.
-    2. NEVER use non-standard pseudo-elements like `::text`, `::attr(...)`, or `:contains(...)`.
-    3. The `container` selector MUST select the card/item root wrapper element (e.g. `div#masonry > div > div > a`).
-    4. Field selectors must be relative to the container element.
-    "#,
-            simplified_dom.trim(),
-            self.target_description.trim()
+        let system_prompt = format!(
+            r#"
+            You are a precise CSS Selector extraction engine.
+            Task: Find important element selectors from HTML DOM tree.
+            Note: "{}"
+            Output format: Provide ONLY a valid JSON object matching this exact shape:
+            {{
+              "fields": {{
+                ... <field selectors, necessary for the Task>
+              }}
+            }}
+            [CSS Selector Strict Rules]
+            - Keep selectors as concise and clean as possible, while ensuring each selector uniquely identifies its target item without ambiguity.
+               - ONLY return standard CSS selectors compatible with `document.querySelector`.
+               - NEVER use non-standard pseudo-elements (`::text`, `::attr(...)`, `:contains(...)`).
+               - DO NOT use Tailwind style classes (e.g., `max-[60px]`).
+            "#,
+            self.page_observation_system_prompt.trim()
         );
 
-        let max_retries = 3;
-        let mut last_error: Option<DynError> = None;
+        let user_prompt = format!(
+            r#"
+            Below is a simplified, REPRESENTATIVE HTML DOM tree:
+                ---
+                {}
+                ---
+            "#,
+            simplified_dom.trim(),
+        );
 
-        for attempt in 1..=max_retries {
-            println!(
-                "Attempt {}/{} requesting LLM for selectors...",
-                attempt, max_retries
-            );
+        let request = GenerationRequest::new(self.model.clone(), user_prompt)
+            .system(system_prompt)
+            .format(FormatType::Json);
+        let llm_response = self.ollama.generate(request).await?;
+        let cleaned_json = lib::page::parse_json_from_llm_response(llm_response.response.trim());
 
-            let request =
-                GenerationRequest::new(self.model.clone(), prompt.clone()).format(FormatType::Json);
+        // 2. JSON 파싱 (serde_json)
+        let parsed_schema: SelectorSchema = serde_json::from_str(&cleaned_json).map_err(|e| {
+            format!(
+                "JSON Deserialization failed: {} | Failed for this data: {}",
+                e, cleaned_json
+            )
+        })?;
 
-            match self.ollama.generate(request).await {
-                Ok(ollama_response) => {
-                    let raw_json = ollama_response.response.trim();
-                    let cleaned_json = crate::lib::page::parse_json_from_llm_response(raw_json);
-
-                    match serde_json::from_str::<SelectorSchema>(&cleaned_json) {
-                        Ok(parsed_schema) => {
-                            println!("🥳 Successfully parsed SelectorSchema! These selectors are looking important...\n {}", parsed_schema);
-                            return Ok(parsed_schema);
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Failed to parse JSON response on attempt {}: {}",
-                                attempt, e
-                            );
-                            eprintln!("Raw LLM Output was: {}", raw_json);
-                            last_error = Some(Box::new(e));
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Ollama API call failed on attempt {}: {}", attempt, e);
-                    last_error = Some(Box::new(e));
-                }
-            }
+        // 3. 실제 DOM 수집 검증
+        let items = lib::page::fetch_target_items(self.page, &parsed_schema).await?;
+        if items.is_empty() {
+            // return Err(format!("Schema '{:?}' returned 0 items from DOM", parsed_schema).into());
+            // just print error and pass emprty result
+            println!("Schema '{}' returned 0 items from DOM", parsed_schema);
+            return Ok(SelectorSchema::default());
         }
 
-        Err(last_error.unwrap_or_else(|| "Failed to extract valid selectors after retries".into()))
+        Ok(parsed_schema)
     }
 
     /// 결정된 Action을 수행하는 헬퍼 메서드 (Tool Calling과 비슷함)
@@ -871,49 +793,71 @@ DO NOT repeat same action 3 times in a row.
                 }
             }
 
-            AgentAction::ClickElement { selector, .. } => {
-                println!("[Action] 요소 클릭 실행: {}", selector);
+            AgentAction::ClickElement { selector, x, y, .. } => {
+                println!("[Action] 좌표 기반 요소 클릭 시도: {}", selector);
                 let history_formatter = HistoryFormatter::new("click", "ClickElement", current_url);
-                let safe_selector = crate::lib::page::sanitize_selector(selector);
 
-                let elem_res = self.page.find_element(&safe_selector).await;
-                match elem_res {
-                    Ok(elem) => match elem.click().await {
-                        Ok(_) => {
-                            // 💡 1. SPA 라우팅 및 애니메이션/네트워크 완료 대기 (필수)
-                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                // 1. x, y 좌표 결정 (액션에 명시되어 있지 않으면 obs.target_elements에서 룩업)
+                let target_point = if let (Some(px), Some(py)) = (x, y) {
+                    Some((*px, *py))
+                } else {
+                    obs.target_elements
+                        .iter()
+                        .find(|item| item.selector == *selector)
+                        .map(|item| (item.center_x, item.center_y))
+                };
 
-                            // 💡 2. 클릭 후 브라우저의 실제 최신 URL 획득
-                            let new_url = self
-                                .page
-                                .current_url()
-                                .await
-                                .unwrap_or_else(|_| current_url.clone());
-                            println!("🔗 [Navigation Success] 이동 완료 URL: {}", new_url);
-                            let msg = history_formatter.format(
-                                "success",
-                                "Element clicked successfully. You can extract the newly loaded data.",
-                                &format!("Successfully clicked element '{}'", selector),
-                            );
-                            Ok((LoopControl::Continue, msg))
+                match target_point {
+                    Some((cx, cy)) => {
+                        println!(
+                            "🎯 [Coordinate Click] 좌표 ({}, {}) 로 마우스 클릭 발사",
+                            cx, cy
+                        );
+
+                        // 2. 좌표 위치로 마우스 이동 및 클릭 이벤트 전송 (CDP Mouse Event)
+                        let click_result = self.page.click_at_point(cx, cy).await;
+
+                        match click_result {
+                            Ok(_) => {
+                                tokio::time::sleep(Duration::from_millis(1500)).await;
+
+                                let new_url = self
+                                    .page
+                                    .current_url()
+                                    .await
+                                    .unwrap_or_else(|_| current_url.clone());
+
+                                println!("🔗 [Click Success] new updated URL: {}", new_url);
+                                let msg = history_formatter.format(
+                                    "success",
+                                    "Successfully clicked target coordinate",
+                                    &format!(
+                                        "Clicked at ({}, {}) for selector '{}'",
+                                        cx, cy, selector
+                                    ),
+                                );
+                                Ok((LoopControl::Continue, msg))
+                            }
+                            Err(e) => {
+                                eprintln!("Click Error at ({}, {}): {}", cx, cy, e);
+                                let msg = history_formatter.format(
+                                    "failed",
+                                    "Coordinate click failed",
+                                    &format!("Failed to click point ({}, {}): {}", cx, cy, e),
+                                );
+                                Ok((LoopControl::Continue, msg))
+                            }
                         }
-                        Err(e) => {
-                            let msg = history_formatter.format(
-                                "failed",
-                                "Element click failed",
-                                &format!("Failed to click element '{}': {}", selector, e),
-                            );
-                            Ok((LoopControl::Continue, msg))
-                        }
-                    },
-                    Err(e) => {
-                        // print error
-                        println!("Click Error: {}", e);
-
+                    }
+                    None => {
+                        eprintln!("⚠️ [Coordinate Miss] '{}' 에 해당하는 좌표를 target_elements에서 찾지 못함", selector);
                         let msg = history_formatter.format(
                             "not_found",
-                            "Element not found",
-                            &format!("Element not found with selector '{}'", selector),
+                            "Coordinate lookup failed",
+                            &format!(
+                                "Could not locate x, y coordinates for selector '{}'",
+                                selector
+                            ),
                         );
                         Ok((LoopControl::Continue, msg))
                     }
@@ -957,5 +901,95 @@ DO NOT repeat same action 3 times in a row.
                 Ok((LoopControl::Finish, msg))
             }
         }
+    }
+
+    /// 메인 루프 실행 메서드
+    pub async fn run(&mut self) -> DynResult<()> {
+        let mut step = 1;
+        loop {
+            println!("\n=== Agent Step {} ===", step);
+
+            // 1. Observe: 스텝 시작 시 DOM, simpleified_dom 관측
+            println!("📍 현재 위치 (debug): {}", self.page.current_url().await?);
+            let agent_observation = self.capture_observation().await?;
+            println!("📍 현재 위치: {}", agent_observation.current_url);
+
+            // 2. 관찰 시점의 Simplified DOM 즉시 저장
+            if let Err(e) = self
+                .save_simplified_dom(
+                    &agent_observation.current_url,
+                    &agent_observation.simplified_dom,
+                )
+                .await
+            {
+                eprintln!("⚠️ [Run Observation DOM Save Warning] {}", e);
+            }
+
+            // 4. Think: LLM 추론 (최대 3회 재시도)
+            let mut action_result = None;
+            for attempt in 1..=3 {
+                match self.ask_step(&agent_observation).await {
+                    Ok(action) => {
+                        action_result = Some(action);
+                        break;
+                    }
+                    Err(e) => {
+                        println!("LLM 요청 실패 ({}/3): {}", attempt, e);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+
+            let action = match action_result {
+                Some(act) => act,
+                None => {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "LLM 요청 3회 연속 실패",
+                    )));
+                }
+            };
+
+            // 소유권 이동 전, 히스토리에 기록할 정보를 미리 준비하거나 참조(&action)로 전달
+            let action_name = action.name().to_string();
+            let reasoning = action.reasoning().to_string();
+
+            // 3. Act: 행동 수행 및 결과 메시지 수집
+            let (control, result_summary) =
+                match self.handle_action(&action, &agent_observation).await {
+                    Ok(res) => res,
+                    Err(e) => (
+                        LoopControl::Continue,
+                        format!("Critical action execution error: {}", e),
+                    ),
+                };
+
+            // Extract data from result_summary if it exists
+            let data = if result_summary.contains("Data: ") {
+                Some(result_summary.split("Data: ").nth(1).unwrap().to_string())
+            } else {
+                None
+            };
+
+            // 4. Record: 행동 명칭, 이유, 실행 결과를 히스토리에 기록
+            let history_entry = ActionHistory {
+                step,
+                action_name,
+                reasoning,
+                status: result_summary,
+                data,
+            };
+            self.history.push(history_entry);
+            self.trim_history();
+
+            // 5. Termination Check: 작업 종료 판단
+            if matches!(control, LoopControl::Finish) {
+                println!("에이전트 작업을 성공적으로 마쳤습니다.");
+                break;
+            }
+
+            step += 1;
+        }
+        Ok(())
     }
 }

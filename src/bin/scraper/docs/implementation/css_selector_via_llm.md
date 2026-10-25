@@ -119,3 +119,56 @@ if schema.container.trim().is_empty() {
 ```
 
 > **Tip:** LLM 프롬프트에 **"Detail/Single pages usually do NOT need a container (leave `container` as `\"\"`), whereas Feed/List pages MUST specify a `container`."** 라는 지침을 명시해 두면 LLM이 페이지 종류에 따라 `container` 유무를 스스로 올바르게 결정합니다.
+
+# container / field 구분을 치워버림 26-10-15
+
+field에 배열이 반환되어서 deserialize오류가 남
+
+해결: SelectorSchema를 배열과 문자열 모두 수용 가능하도록 유연화 (Rust 코드 보정)
+
+LLM이 단일 셀렉터("a")를 보내든 배열(["a1", "a2"])을 보내든 **모두 하나의 셀렉터(쉼표 ,로 연결된 멀티 셀렉터)**로 자동 병합하도록 커스텀 디세리얼라이저를 적용하면 에러를 완벽히 차단할 수 있습니다.
+
+아니야 배열로 보내면 따로따로 element를 가져와야 되는데?
+
+CSS 구문상 쉼표(,)로 연결된 셀렉터문(예: a[href='...'], a[href='...'])을 document.querySelectorAll에 전달하면, 브라우저가 배열에 든 각 요소들을 독립된 개별 DOM Element로 각각 찾아냅니다.
+
+즉, 배열 요소를 쉼표로 결합하여 단일 셀렉터 문자열로 다루어도 결과는 완전히 동일합니다.
+
+- serde 의 Deserializer, deserialize_with 사용
+
+```rust
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorSchema {
+    #[serde(deserialize_with = "deserialize_fields")]
+    pub fields: HashMap<String, String>,
+}
+
+fn deserialize_fields<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Single(String),
+        List(Vec<String>),
+    }
+
+    let raw_map: HashMap<String, StringOrVec> = HashMap::deserialize(deserializer)?;
+    let mut clean_map = HashMap::new();
+
+    for (k, v) in raw_map {
+        let joined_selector = match v {
+            StringOrVec::Single(s) => s,
+            // 배열로 들어오면 CSS 멀티 셀렉터(,)로 결합하여 각각의 요소를 다 수집함
+            StringOrVec::List(list) => list.join(", "),
+        };
+        clean_map.insert(k, joined_selector);
+    }
+
+    Ok(clean_map)
+}
+```

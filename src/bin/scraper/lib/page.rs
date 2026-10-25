@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use regex::{Captures, Regex};
 use schemars::JsonSchema;
 use scraper::{ElementRef, Html, Selector};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
@@ -27,49 +27,7 @@ pub trait PageTrait: Send + Sync {
     async fn current_url(&self) -> DynResult<String>;
     async fn navigate(&self, url: &str) -> DynResult<()>;
     async fn screenshot(&self) -> DynResult<Vec<u8>>;
-
-    /// SelectorSchema에 정의된 필드들을 순회하며 ExtractedData 생성
-    async fn collect_schema_data(
-        &self,
-        schema: &SelectorSchema,
-    ) -> DynResult<ExtractedContentWrapper> {
-        let container_sel = schema.container.trim();
-
-        if !container_sel.is_empty() {
-            let rows = get_container_rows(self, schema).await?;
-            println!(
-                "Successfully Extracted {} rows from list container.",
-                rows.len()
-            );
-
-            Ok(ExtractedContentWrapper {
-                data: ExtractedContent::List(rows),
-            })
-        } else {
-            let mut data = HashMap::new();
-
-            for (field_name, field_selector) in &schema.fields {
-                if let Ok(Some(info)) = get_element_info(self, field_selector).await {
-                    data.insert(field_name.clone(), info);
-                } else {
-                    data.insert(
-                        field_name.clone(),
-                        ElementRefInfo {
-                            selector: field_selector.clone(),
-                            text_content: None,
-                            rect: None,
-                            href: None,
-                            src: None,
-                        },
-                    );
-                }
-            }
-
-            Ok(ExtractedContentWrapper {
-                data: ExtractedContent::Single(data),
-            })
-        }
-    }
+    async fn click_at_point(&self, x: f64, y: f64) -> DynResult<()>;
 }
 
 // ============================================================================
@@ -160,10 +118,37 @@ impl fmt::Display for ExtractedContentWrapper {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SelectorSchema {
-    pub container: String,
+    /// 필드명과 원본 DOM에서 바로 querySelectorAll로 수집할 수 있는 Full CSS Selector
+    #[serde(deserialize_with = "deserialize_fields")]
     pub fields: HashMap<String, String>,
+}
+
+fn deserialize_fields<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Single(String),
+        List(Vec<String>),
+    }
+
+    let raw_map: HashMap<String, StringOrVec> = HashMap::deserialize(deserializer)?;
+    let mut clean_map = HashMap::new();
+
+    for (k, v) in raw_map {
+        let joined_selector = match v {
+            StringOrVec::Single(s) => s,
+            // 배열로 들어오면 CSS 멀티 셀렉터(,)로 결합하여 각각의 요소를 다 수집함
+            StringOrVec::List(list) => list.join(", "),
+        };
+        clean_map.insert(k, joined_selector);
+    }
+
+    Ok(clean_map)
 }
 
 impl fmt::Display for SelectorSchema {
@@ -200,302 +185,80 @@ pub fn sanitize_selector(selector: &str) -> String {
         format!(".{}\\[{}\\]", &caps[1], &caps[2])
     });
 
-    step3.to_string()
+    // group/link 같은 Tailwind 슬래시 이스케이프 (\/)
+    let re_slash_class = Regex::new(r"([a-zA-Z0-9_\-]+)/([a-zA-Z0-9_\-]+)").unwrap();
+    let step4 = re_slash_class.replace_all(&step3, |caps: &Captures| {
+        format!("{}\\{}", &caps[1], &caps[2])
+    });
+
+    step4.to_string()
 }
 
-pub async fn get_element_info<P: PageTrait + ?Sized>(
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetItem {
+    pub selector: String,
+    pub target_url: Option<String>, // 중복 체크 기준 (href 절대 경로)
+    pub center_x: f64,
+    pub center_y: f64,
+}
+
+pub async fn fetch_target_items<P: PageTrait>(
     page: &P,
-    raw_selector: &str,
-) -> Result<Option<ElementRefInfo>, DynError> {
-    let safe_selector = sanitize_selector(raw_selector);
-    let selector_json = serde_json::to_string(&safe_selector)?;
-    let js_script = format!(
+    schema: &SelectorSchema,
+) -> Result<Vec<TargetItem>, DynError> {
+    let schema_json = serde_json::to_string(schema)?;
+
+    println!("🐏 Fetching target items with schema: {}", schema_json);
+
+    let js_code = format!(
         r#"
         (() => {{
-            const rawSelector = {};
+            const schema = {};
+            const results = [];
+            const visitedSet = new Set();
 
-            const el = document.querySelector(rawSelector);
-            if (!el) return null;
-            const rect = el.getBoundingClientRect();
-            return {{
-                selector: rawSelector,
-                text_content: el.innerText ? el.innerText.trim() : el.textContent.trim(),
-                outer_html: el.outerHTML,
-                rect: {{
-                    x: rect.x + window.scrollX,
-                    y: rect.y + window.scrollY,
-                    width: rect.width,
-                    height: rect.height
+            for (const [field_name, selector] of Object.entries(schema.fields || {{}})) {{
+                if (!selector) continue;
+                try {{
+                    const elements = document.querySelectorAll(selector);
+                    elements.forEach((el) => {{
+                        const href = el.getAttribute('href') || el.closest('a')?.getAttribute('href');
+                        let target_url = '';
+                        if (href) {{
+                            try {{
+                                target_url = new URL(href, window.location.href).href;
+                            }} catch(e) {{
+                                target_url = href;
+                            }}
+                        }}
+
+                        const rect = el.getBoundingClientRect();
+                        const key = selector + '|' + target_url + '|' + rect.left + '|' + rect.top;
+
+                        if (!visitedSet.has(key) && (rect.width > 0 || rect.height > 0 || target_url)) {{
+                            visitedSet.add(key);
+                            results.push({{
+                                selector: selector,
+                                target_url: target_url,
+                                center_x: rect.left + rect.width / 2,
+                                center_y: rect.top + rect.height / 2,
+                                text: el.innerText ? el.innerText.trim().slice(0, 100) : ''
+                            }});
+                        }}
+                    }});
+                }} catch(e) {{
+                    console.error('Selector error:', selector, e);
                 }}
-            }};
+            }}
+            return results;
         }})()
         "#,
-        selector_json
+        schema_json
     );
 
-    let result: Option<ElementRefInfo> = match page.evaluate(&js_script).await {
-        Ok(result_str) => {
-            if result_str == "null" || result_str.is_empty() {
-                None
-            } else {
-                Some(serde_json::from_str(&result_str)?)
-            }
-        }
-        Err(e) => {
-            eprintln!("Evaluation 오류: {} of selector_json: {}", e, safe_selector);
-            None
-        }
-    };
-    Ok(result)
-}
-
-pub async fn get_container_rows<P: PageTrait + ?Sized>(
-    page: &P,
-    schema: &SelectorSchema,
-) -> Result<Vec<HashMap<String, Option<ElementRefInfo>>>, DynError> {
-    let container_json = serde_json::to_string(&sanitize_selector(&schema.container))?;
-
-    let mut sanitized_fields = HashMap::new();
-    for (k, v) in &schema.fields {
-        sanitized_fields.insert(k.clone(), sanitize_selector(v));
-    }
-    let fields_json = serde_json::to_string(&sanitized_fields)?;
-
-    let js_script = format!(
-        r#"
-        (() => {{
-            const toAbsUrl = (urlStr) => {{
-                if (!urlStr) return null;
-                try {{
-                    return new URL(urlStr, document.baseURI).href;
-                }} catch (e) {{
-                    return urlStr;
-                }}
-            }};
-
-            const containerSel = {container_json};
-            const fieldsMap = {fields_json};
-
-            const containers = document.querySelectorAll(containerSel);
-            if (containers.length === 0) return JSON.stringify([]);
-
-            const results = Array.from(containers).map(parent => {{
-                const item = {{}};
-                for (const [key, rawFieldSel] of Object.entries(fieldsMap)) {{
-                    if (!rawFieldSel) continue;
-
-                    let targetEl = null;
-                    const trimmedSel = rawFieldSel.trim();
-
-                    if (trimmedSel === '.' || trimmedSel === ':scope' || (trimmedSel === 'a' && parent.tagName.toLowerCase() === 'a')) {{
-                        targetEl = parent;
-                    }} else {{
-                        const selectorToUse = trimmedSel.startsWith('>')
-                            ? `:scope ${{trimmedSel}}`
-                            : trimmedSel;
-                        targetEl = parent.querySelector(selectorToUse);
-                    }}
-
-                    if (targetEl) {{
-                        const rect = targetEl.getBoundingClientRect();
-                        const hrefAttr = targetEl.getAttribute('href') || targetEl.closest('a')?.getAttribute('href') || targetEl.querySelector('a')?.getAttribute('href');
-                        const srcAttr = targetEl.getAttribute('src') || targetEl.getAttribute('data-src') || targetEl.querySelector('img')?.getAttribute('src');
-                        const textContent = (targetEl.innerText || targetEl.textContent || '').trim();
-
-                        item[key] = {{
-                            selector: trimmedSel,
-                            text_content: textContent.length > 0 ? textContent : null,
-                            href: toAbsUrl(hrefAttr),
-                            src: toAbsUrl(srcAttr),
-                            rect: {{
-                                x: rect.x + window.scrollX,
-                                y: rect.y + window.scrollY,
-                                width: rect.width,
-                                height: rect.height
-                            }}
-                        }};
-                    }} else {{
-                        item[key] = null;
-                    }}
-                }}
-                return item;
-            }});
-
-            return JSON.stringify(results);
-        }})()
-        "#
-    );
-
-    let result_str = page.evaluate(&js_script).await?;
-    let items: Vec<HashMap<String, Option<ElementRefInfo>>> =
-            serde_json::from_str(&result_str).map_err(|e| {
-                format!(
-                    "Failed to deserialize JSON to Vec<HashMap<String, Option<ElementRefInfo>>>: {}\nRaw JSON Output:\n{}",
-                    e, result_str
-                )
-            })?;
+    let eval_res = page.evaluate(&js_code).await?;
+    let items: Vec<TargetItem> = serde_json::from_str(&eval_res)?;
     Ok(items)
-}
-
-pub async fn extract_by_selector_schema<P: PageTrait>(
-    page: &P,
-    schema: &SelectorSchema,
-) -> Result<ExtractedContentWrapper, DynError> {
-    page.collect_schema_data(schema).await
-}
-
-/// SelectorSchema 기반으로 화면상에 실제 노출된(유효한) 요소 정보 및 절대 경로 URL을 검증/수집합니다.
-pub async fn locate_selector_schema_elements<P: PageTrait + ?Sized>(
-    page: &P,
-    schema: &SelectorSchema,
-) -> Result<ExtractedContentWrapper, DynError> {
-    let container_sel = schema.container.trim();
-
-    // 공통 JS 헬퍼 유틸리티 함수 정의
-    let js_helpers = r#"
-        const toAbsUrl = (urlStr) => {
-            if (!urlStr) return null;
-            try {
-                return new URL(urlStr, document.baseURI).href;
-            } catch (e) {
-                return urlStr;
-            }
-        };
-
-        const isElementVisible = (el) => {
-            if (!el) return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 &&
-                   rect.height > 0 &&
-                   style.visibility !== 'hidden' &&
-                   style.display !== 'none' &&
-                   style.opacity !== '0';
-        };
-
-        const extractRefInfo = (el, rawSel) => {
-            const rect = el.getBoundingClientRect();
-
-            // href: 자신 또는 상위/하위 <a> 태그 탐색
-            const hrefAttr = el.getAttribute('href') || el.closest('a')?.getAttribute('href') || el.querySelector('a')?.getAttribute('href');
-
-            // src: 자신 또는 하위 <img> 태그 탐색
-            const srcAttr = el.getAttribute('src') || el.getAttribute('data-src') || el.querySelector('img')?.getAttribute('src');
-
-            const textContent = (el.innerText || el.textContent || '').trim();
-
-            return {
-                selector: rawSel,
-                text_content: textContent.length > 0 ? textContent : null,
-                href: toAbsUrl(hrefAttr),
-                src: toAbsUrl(srcAttr),
-                rect: {
-                    x: rect.x + window.scrollX,
-                    y: rect.y + window.scrollY,
-                    width: rect.width,
-                    height: rect.height
-                }
-            };
-        };
-    "#;
-
-    if container_sel.is_empty() {
-        // ---------------------------------------------------------------------
-        // 1. Single 모드 (상세 페이지 / 단일 요소)
-        // ---------------------------------------------------------------------
-        let mut sanitized_fields = HashMap::new();
-        for (k, v) in &schema.fields {
-            sanitized_fields.insert(k.clone(), sanitize_selector(v));
-        }
-        let fields_json = serde_json::to_string(&sanitized_fields)?;
-
-        let js_script = format!(
-            r#"
-            (() => {{
-                {js_helpers}
-
-                const fieldsMap = {fields_json};
-                const result = {{}};
-
-                for (const [key, rawSel] of Object.entries(fieldsMap)) {{
-                    if (!rawSel) continue;
-                    const el = document.querySelector(rawSel);
-                    if (isElementVisible(el)) {{
-                        result[key] = extractRefInfo(el, rawSel);
-                    }}
-                }}
-                return JSON.stringify(result);
-            }})()
-            "#
-        );
-
-        let result_str: String = page.evaluate(&js_script).await?;
-        let single_map: HashMap<String, ElementRefInfo> = serde_json::from_str(&result_str)?;
-
-        Ok(ExtractedContentWrapper {
-            data: ExtractedContent::Single(single_map),
-        })
-    } else {
-        // ---------------------------------------------------------------------
-        // 2. List 모드 (피드 / 목록 페이지)
-        // ---------------------------------------------------------------------
-        let container_json = serde_json::to_string(&sanitize_selector(container_sel))?;
-
-        let mut sanitized_fields = HashMap::new();
-        for (k, v) in &schema.fields {
-            sanitized_fields.insert(k.clone(), sanitize_selector(v));
-        }
-        let fields_json = serde_json::to_string(&sanitized_fields)?;
-
-        let js_script = format!(
-            r#"
-            (() => {{
-                {js_helpers}
-
-                const containerSel = {container_json};
-                const fieldsMap = {fields_json};
-
-                const containers = document.querySelectorAll(containerSel);
-                if (containers.length === 0) return JSON.stringify([]);
-
-                const results = Array.from(containers).map(parent => {{
-                    const item = {{}};
-
-                    for (const [key, rawFieldSel] of Object.entries(fieldsMap)) {{
-                        if (!rawFieldSel) continue;
-
-                        let targetEl = null;
-                        const trimmedSel = rawFieldSel.trim();
-
-                        if (trimmedSel === '.' || trimmedSel === ':scope' || (trimmedSel === 'a' && parent.tagName.toLowerCase() === 'a')) {{
-                            targetEl = parent;
-                        }} else {{
-                            const selectorToUse = trimmedSel.startsWith('>')
-                                ? `:scope ${{trimmedSel}}`
-                                : trimmedSel;
-                            targetEl = parent.querySelector(selectorToUse);
-                        }}
-
-                        if (isElementVisible(targetEl)) {{
-                            item[key] = extractRefInfo(targetEl, trimmedSel);
-                        }}
-                    }}
-                    return item;
-                }});
-
-                return JSON.stringify(results);
-            }})()
-            "#
-        );
-
-        let result_str: String = page.evaluate(&js_script).await?;
-        let list_vec: Vec<HashMap<String, Option<ElementRefInfo>>> =
-            serde_json::from_str(&result_str)?;
-
-        Ok(ExtractedContentWrapper {
-            data: ExtractedContent::List(list_vec),
-        })
-    }
 }
 
 pub fn parse_json_from_llm_response(raw_response: &str) -> String {
@@ -619,44 +382,6 @@ pub async fn get_simplified_dom_tree<P: PageTrait>(page: &P) -> Result<String, D
     Ok(tree)
 }
 
-pub fn parse_html_rows(raw_html: &str, schema: &SelectorSchema) -> Result<Value, DynError> {
-    let document = Html::parse_document(raw_html);
-
-    let container_selector = Selector::parse(&schema.container)
-        .map_err(|e| format!("Invalid container selector '{}': {:?}", schema.container, e))?;
-
-    let mut field_selectors: HashMap<String, Selector> = HashMap::new();
-    for (field_name, selector_str) in &schema.fields {
-        if let Ok(sel) = Selector::parse(selector_str) {
-            field_selectors.insert(field_name.clone(), sel);
-        } else {
-            eprintln!(
-                "⚠️ Warning: Failed to parse selector '{}' for field '{}'",
-                selector_str, field_name
-            );
-        }
-    }
-
-    let mut results = Vec::new();
-
-    for container_el in document.select(&container_selector) {
-        let mut item_data = HashMap::new();
-
-        for (field_name, selector) in &field_selectors {
-            if let Some(target_el) = container_el.select(selector).next() {
-                let value = parse_field_value(field_name, &target_el);
-                item_data.insert(field_name.clone(), value);
-            } else {
-                item_data.insert(field_name.clone(), String::new());
-            }
-        }
-
-        results.push(item_data);
-    }
-
-    Ok(json!(results))
-}
-
 fn parse_field_value(field_name: &str, element: &ElementRef) -> String {
     let name_lower = field_name.to_lowercase();
 
@@ -702,126 +427,5 @@ fn parse_field_value(field_name: &str, element: &ElementRef) -> String {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
-    }
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::lib::dyn_result::DynResult;
-    use crate::ChromiumPageAdapter;
-
-    use chromiumoxide::browser::{Browser, BrowserConfig};
-    use futures::StreamExt;
-    use std::fs::read_to_string;
-    use std::path::PathBuf;
-
-    #[tokio::test]
-    async fn test_get_simplify_dom() -> Result<(), DynError> {
-        let mut test_html_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        test_html_path.push("src/bin/scraper/lib/test.html");
-
-        let test_html_content = read_to_string(&test_html_path).map_err(|e| {
-            format!(
-                "테스트 HTML 파일을 읽을 수 없습니다 ({:?}): {}",
-                test_html_path, e
-            )
-        })?;
-
-        let (mut browser, mut handler) = Browser::launch(
-            BrowserConfig::builder()
-                .arg("--headless=new")
-                .arg("--no-sandbox")
-                .build()?,
-        )
-        .await?;
-
-        let handle = tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                if let Err(_e) = event {}
-            }
-        });
-
-        let page = browser.new_page("about:blank").await?;
-        page.set_content(&test_html_content).await?;
-
-        let page_adapter = ChromiumPageAdapter { page };
-        let simplified_dom_tree = get_simplified_dom_tree(&page_adapter).await?;
-
-        assert!(
-            !simplified_dom_tree.is_empty(),
-            "simplified_dom_tree is empty"
-        );
-        assert!(
-            simplified_dom_tree.len() <= test_html_content.len(),
-            "simplified_dom_tree is longer than test_html_content"
-        );
-
-        browser.close().await?;
-        handle.abort();
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_element() -> DynResult<()> {
-        let test_html_content = r#"
-        <main class="container">
-            <article class="card">
-                <h2 class="title"><a href="/post/1">첫 번째 글 제목</a></h2>
-                <span class="author">작성자A</span>
-            </article>
-            <article class="card">
-                <h2 class="title"><a href="/post/2">두 번째 글 제목</a></h2>
-                <span class="author">작성자B</span>
-            </article>
-        </main>
-        "#;
-
-        let (mut browser, mut handler) = Browser::launch(
-            BrowserConfig::builder()
-                .arg("--headless=new")
-                .arg("--no-sandbox")
-                .build()?,
-        )
-        .await?;
-
-        let handle = tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                if let Err(e) = event {
-                    eprintln!("Chromium handler event error: {:?}", e);
-                }
-            }
-        });
-
-        let page = browser.new_page("about:blank").await?;
-        page.set_content(test_html_content).await?;
-        let page_adapter = ChromiumPageAdapter { page };
-
-        let selector = "main a[href]";
-        let result = get_element_info(&page_adapter, selector).await?;
-        let info = result.expect("요소를 찾지 못했습니다");
-
-        println!("선택자: {}", info.selector);
-
-        if let Some(text) = &info.text_content {
-            println!("추출된 텍스트: {text}");
-            assert!(!text.is_empty(), "텍스트 내용이 비어 있습니다.");
-        }
-
-        let rect = info.rect.expect("ElementRect 정보를 찾을 수 없습니다.");
-        println!("추출된 좌표: {:?}", rect);
-
-        assert!(rect.width > 0.0, "width가 0 이하입니다.");
-        assert!(rect.height > 0.0, "height가 0 이하입니다.");
-
-        browser.close().await?;
-        handle.abort();
-
-        Ok(())
     }
 }
