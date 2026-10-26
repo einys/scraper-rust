@@ -4,8 +4,9 @@ use schemars::JsonSchema;
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::fmt;
+use std::time::Instant;
+use std::{collections::HashMap, time::Duration};
 
 use crate::lib::dyn_result::{DynError, DynResult};
 
@@ -202,7 +203,28 @@ pub struct TargetItem {
     pub center_y: f64,
 }
 
-pub async fn fetch_target_items<P: PageTrait>(
+impl std::fmt::Display for TargetItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Selector: {}, Target URL: {:?}, Center X: {}, Center Y: {}",
+            self.selector, self.target_url, self.center_x, self.center_y
+        )
+    }
+}
+
+impl TargetItem {
+    pub fn new(selector: String, target_url: Option<String>, center_x: f64, center_y: f64) -> Self {
+        TargetItem {
+            selector,
+            target_url,
+            center_x,
+            center_y,
+        }
+    }
+}
+
+pub async fn get_target_items<P: PageTrait>(
     page: &P,
     schema: &SelectorSchema,
 ) -> Result<Vec<TargetItem>, DynError> {
@@ -226,9 +248,13 @@ pub async fn fetch_target_items<P: PageTrait>(
                         const anchorEl = el.tagName === 'A' ? el : el.closest('a');
                         const targetEl = anchorEl || el; // <a> 태그가 없으면 원본 요소 유지
 
+
                         let target_url = '';
                         if (anchorEl) {{
-                            const href = anchorEl.getAttribute('href');
+                            let href = anchorEl.getAttribute('href');
+                            if (!href && el.closest('a')) {{ // href 가 없다면 가까운 <a> 태그를 찾아 실제 클릭 타겟으로 승격
+                                href = el.closest('a').getAttribute('href');
+                            }}
                             if (href) {{
                                 try {{
                                     target_url = new URL(href, window.location.href).href;
@@ -503,5 +529,59 @@ pub async fn inject_visual_cursor<P: PageTrait>(page: &P) -> DynResult<()> {
     "#;
 
     page.evaluate(js_code).await?;
+    Ok(())
+}
+
+/// 페이지의 document.readyState가 'complete'가 될 때까지 최대 timeout_secs 동안 대기합니다.
+pub async fn wait_for_page_load<P: PageTrait>(
+    page: &P,
+    timeout_secs: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let wait_js = format!(
+        r#"
+        new Promise((resolve) => {{
+            if (document.readyState === 'complete') {{
+                resolve(true);
+                return;
+            }}
+
+            const timer = setTimeout(() => resolve(false), {});
+
+            window.addEventListener('load', () => {{
+                clearTimeout(timer);
+                resolve(true);
+            }}, {{ once: true }});
+        }})
+        "#,
+        timeout_secs * 1000
+    );
+
+    // 1단계: 브라우저 내부 load 이벤트 감지
+    let _ = page.evaluate(&wait_js).await;
+
+    // 2단계: SPA 동적 렌더링(Masonry 카드 등) 안정을 위한 추가 폴링 루프
+    // 2단계: SPA 동적 렌더링(Masonry 카드 등) 안정을 위한 추가 폴링 루프
+    while start_time.elapsed() < timeout {
+        let is_complete = match page.evaluate("document.readyState === 'complete'").await {
+            Ok(res) => res.trim().trim_matches('"') == "true",
+            Err(_) => false,
+        };
+
+        if is_complete {
+            // SPA DOM 마운트를 위해 짧은 안정화 딜레이 (300ms)
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    println!(
+        "⚠️ [Page Load Timeout] {}초 내에 페이지 로드가 완료되지 않았으나 계속 진행합니다.",
+        timeout_secs
+    );
     Ok(())
 }

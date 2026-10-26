@@ -101,6 +101,7 @@ pub enum AgentAction {
     ClickElement {
         reasoning: String,
         selector: String,
+        target_url: String,
         x: Option<f64>,
         y: Option<f64>,
     },
@@ -153,7 +154,16 @@ impl AgentAction {
             AgentAction::ReadFile { filename, .. } => format!("ReadFile({})", filename),
             AgentAction::WriteFile { filename, .. } => format!("WriteFile({})", filename),
             AgentAction::ScrollPage { dy, .. } => format!("ScrollPage(dy={})", dy),
-            AgentAction::ClickElement { selector, .. } => format!("ClickElement({})", selector),
+            AgentAction::ClickElement {
+                selector,
+                target_url,
+                x,
+                y,
+                ..
+            } => format!(
+                "ClickElement(selector={}, url={} x={:?}, y={:?})",
+                selector, target_url, x, y
+            ),
             AgentAction::Finish { reason, .. } => format!("Finish({})", reason),
             // AgentAction::ExtractData { .. } => {
             //     format!("ExtractData")
@@ -275,7 +285,12 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
 
     pub fn is_visited(&self, url: &str) -> bool {
         let normalized = normalize_url(url);
-        self.visited_urls.contains(&normalized)
+        let is_visited = self.visited_urls.contains(&normalized);
+        println!(
+            "Debug: URL {:?} is visited: {} in {:?}",
+            url, is_visited, self.visited_urls
+        );
+        is_visited
     }
 
     // 💡 max_history_depth를 고려하여 오래된 history부터 제거하는 메소드 (FIFO 형식)
@@ -381,15 +396,6 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         let current_url = self.page.current_url().await.unwrap_or_default();
         println!("👀 Observing current page: {}", current_url);
 
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                .unwrap()
-                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"]),
-        );
-        spinner.set_message("Waiting LLM to finish observation...\n");
-        spinner.enable_steady_tick(Duration::from_millis(100));
-
         // 💡 SPA/비동기 DOM 렌더링 완성 대기
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -409,16 +415,44 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         let simplified_dom = crate::lib::page::get_simplified_dom_tree(self.page).await?;
         let html_content = self.page.content().await?;
 
-        // 3. 셀렉터 추출 및 타겟 항목 수집
-        let selectors = self.ask_important_selectors(&simplified_dom).await?;
-        let target_elements = lib::page::fetch_target_items(self.page, &selectors).await?;
+        // 3. 셀렉터 추출 및 타겟 항목 수집 (최대 3회 재시도)
 
-        // if target elements are emprty, print error
-        if target_elements.is_empty() {
-            println!("⚠️ Warning: No target elements found.");
-        }
+        let mut attempt = 0;
+        let max_selector_retries = 3;
+        let (selectors, target_elements) = loop {
+            if let Ok(s) = self.ask_important_selectors(&simplified_dom).await {
+                if let Ok(items) = lib::page::get_target_items(self.page, &s).await {
+                    if !items.is_empty() {
+                        break (s, items); // 👈 루프 탈출과 동시에 튜플 반환!
+                    }
+                }
+            }
+            attempt += 1;
 
-        spinner.finish_with_message("Done!\n");
+            if attempt >= max_selector_retries {
+                // 💥 3회 시도 실패 시
+
+                println!("⚠️ [Fallback Selector] 0개 요소 수집됨. 범용 카드 링크 셀렉터(a[href*='/i/'])로 fallback 시도");
+                let mut fallback_schema = SelectorSchema::default();
+                fallback_schema.fields.insert(
+                    "item_link".to_string(),
+                    "a[href*='/i/'], main a".to_string(),
+                );
+
+                if let Ok(fallback_items) =
+                    lib::page::get_target_items(self.page, &fallback_schema).await
+                {
+                    break (fallback_schema, fallback_items);
+                } else {
+                    eprintln!("⚠️ [Fallback Selector] a[href] fallback 시도에도 여전히 어떤 element도 관찰되지 않음. 빈 배열 반환.");
+                    // default
+                    break (SelectorSchema::default(), Vec::new());
+                }
+            }
+
+            eprintln!("⚠️ [Selector Retry] 수집된 DOM 요소가 0개입니다. 셀렉터를 다시 추출합니다. ({}/{})",attempt, max_selector_retries);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        };
 
         Ok(AgentObservation {
             simplified_dom,
@@ -548,8 +582,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             "목록에 포함된 Actions List:\n{}...",
             action_guide.chars().take(200).collect::<String>()
         );
-        println!("History:\n{}", self.history_to_string());
-        println!("Visited Urls:\n{:?}", self.visited_urls);
+        println!("[History]\n{}", self.history_to_string());
+        println!("[Visited Urls]\n{:?}", self.visited_urls);
 
         // system prompt build
         let system_prompt = format!(
@@ -583,7 +617,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
 
         // user prompt (current state prompt) build
         let elem = match &obs.focused_selectors {
-            Some(schema) => lib::page::fetch_target_items(self.page, schema).await?,
+            Some(schema) => lib::page::get_target_items(self.page, schema).await?,
             None => Vec::new(),
         };
 
@@ -593,7 +627,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             .unwrap_or_else(|_| format!("{:#?}", focused_elem));
 
         println!(
-            "🔎 [DOM Elements Preview]:\n{}",
+            "🔎 [DOM Elements Focused]:\n{}",
             focused_elem_json.chars().take(500).collect::<String>()
         );
 
@@ -629,7 +663,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"]),
         );
 
-        spinner.set_message("LLM 응답 대기 중");
+        spinner.set_message("LLM response wating...");
         spinner.enable_steady_tick(Duration::from_millis(100));
 
         // llm 요청 던짐
@@ -639,14 +673,14 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         spinner.finish_with_message("완료!\n");
 
         // llm response 가져옴
-        println!("Agent가 생각한 다음 action 초안: {}", response_text);
+        println!("Agent thinks the next action is: {}", response_text);
 
         let clean_json = crate::lib::page::parse_json_from_llm_response(response_text);
 
         let action: AgentAction = serde_json::from_str(&clean_json)?;
 
-        println!("\n🧠 [Agent Thinking]: {}", action.reasoning());
-        println!("\n🏃 [Agent Action]: {:?}", action);
+        // println!("\n🧠 [Agent Thinking]: {}", action.reasoning());
+        // println!("\n🏃 [Agent Action]: {:?}", action);
 
         // println!("Enter를 누르면 계속 진행합니다...");
 
@@ -700,11 +734,22 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             simplified_dom.trim(),
         );
 
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"]),
+        );
+        spinner.set_message("Waiting LLM to finish DOM element selection...\n");
+        spinner.enable_steady_tick(Duration::from_millis(100));
+
         let request = GenerationRequest::new(self.model.clone(), user_prompt)
             .system(system_prompt)
             .format(FormatType::Json);
         let llm_response = self.ollama.generate(request).await?;
         let cleaned_json = lib::page::parse_json_from_llm_response(llm_response.response.trim());
+
+        spinner.finish_with_message("Done!\n");
 
         // 2. JSON 파싱 (serde_json)
         let parsed_schema: SelectorSchema = serde_json::from_str(&cleaned_json).map_err(|e| {
@@ -715,7 +760,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         })?;
 
         // 3. 실제 DOM 수집 검증
-        let items = lib::page::fetch_target_items(self.page, &parsed_schema).await?;
+        let items = lib::page::get_target_items(self.page, &parsed_schema).await?;
         if items.is_empty() {
             // return Err(format!("Schema '{:?}' returned 0 items from DOM", parsed_schema).into());
             // just print error and pass emprty result
@@ -732,12 +777,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         items: Vec<TargetItem>,
         max_items: usize,
     ) -> DynResult<Vec<TargetItem>> {
-        if items.len() <= max_items {
-            return Ok(items);
-        }
-
         println!(
-            "🟠 Focusing to {} items from {} items...",
+            "🟠 Filtering valid items and focusing to max {} items from {} items...",
             max_items,
             items.len(),
         );
@@ -767,15 +808,24 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                     None => true, // URL 정보가 없으면 유지
                 };
 
-                is_valid_coord && is_not_visited
+                // 외부 도메인으로 튕겨 나가는 것을 막기 위해 도메인 필터링 조건을 추가해 주는 것이 더 완벽합니다.
+                let is_same_domain = match &item.target_url {
+                    Some(url) => {
+                        url.contains(&normalize_url(&self.target_webpage)) || url.starts_with('/')
+                    }
+                    None => true,
+                };
+                is_valid_coord && is_not_visited && is_same_domain
             })
             .take(30) // 최대 30개만 프롬프트에 입력!
             .collect();
 
+        // 이미 별로 안 남았으면 리턴
         if valid_unvisited_items.len() <= max_items {
             return Ok(valid_unvisited_items);
         }
 
+        // 많으면 llm한테 물어봄
         let items_json = serde_json::to_string_pretty(&valid_unvisited_items)
             .unwrap_or_else(|_| format!("{:#?}", valid_unvisited_items));
 
@@ -794,11 +844,14 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             {}
 
 
-            For the Goal, Action History, Current DOM Observation Elements, which elements are interesting or important for the next probable action? Summarize it in max. 300 tokens.
+            Select at most {} items from Candidate DOM Observation Elements for the next action step.
+            Output strictly as JSON. Do not add text or markdown.
+            Do Not create unexisting fields or elements. Only return exisiting elements precisely, as it is.
             #",
             self.system_task_prompt,
             self.history_to_string(),
-            items_json
+            items_json,
+            max_items
         );
 
         // 3. LLM 호출
@@ -821,7 +874,10 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         let response = match self.ollama.generate(request).await {
             Ok(resp) => resp,
             Err(e) => {
-                println!("⚠️ [Focus LLM Error] LLM 필터링 실패, Fallback 적용: {}", e);
+                println!(
+                    "⚠️ [Focus LLM Error] LLM 필터링 실패, Fallback 적용하여 앞쪽에 있는 아이템들 선택: {}",
+                    e
+                );
                 return Ok(valid_unvisited_items.into_iter().take(max_items).collect());
             }
         };
@@ -836,21 +892,156 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             cleaned_json
         );
 
-        let items_vec = serde_json::from_str::<TargetItemWrapper>(&cleaned_json)
+        let chosen_items_vec = serde_json::from_str::<TargetItemWrapper>(&cleaned_json)
             .map(|parsed| parsed.into_vec())
             .unwrap_or_default();
 
-        if !items_vec.is_empty() {
+        if !chosen_items_vec.is_empty() {
             println!(
                 "🎯 [Selector Focus Engine] 처음 {}개 중 최종 {}개 유효 요소를 선택함",
                 items.len(),
-                items_vec.len()
+                chosen_items_vec.len()
             );
-            Ok(items_vec.into_iter().take(max_items).collect())
+            Ok(chosen_items_vec.into_iter().take(max_items).collect())
         } else {
             println!("⚠️ [Focus LLM Warning] LLM 응답 파싱 실패 또는 빈 배열. 유효 Fallback 적용.");
             Ok(valid_unvisited_items.into_iter().take(max_items).collect())
         }
+    }
+
+    /// TargetItem 정보를 바탕으로 target_url 기반 exact anchor 클릭을 시도하고,
+    /// 실패 시 (center_x, center_y) 좌표로 CDP Native 마우스 이동 및 클릭을 수행합니다.
+    pub async fn click_element_smart(
+        &self,
+        item: &TargetItem,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // // 💡 1. target_url이 명시되어 있다면(Some이라면) DOM에서 해당 <a> 태그를 찾아 exact click 우선 시도
+        // if let Some(url) = &item.target_url {
+        //     let relative_path = if let Ok(parsed) = url::Url::parse(url) {
+        //         parsed.path().to_string()
+        //     } else {
+        //         url.to_string()
+        //     };
+
+        //     // 시각화 요소 주입 (실패하더라도 클릭 본체 로직에 영향을 주지 않도록 에러 무시)
+        //     // ((현재 다른 위치에서 하는 중))
+        //     // if let Err(e) = lib::page::inject_visual_cursor(self.page).await {
+        //     //     eprintln!(
+        //     //         "⚠️ [Visual Cursor Warning] 커서 주입 실패 (계속 진행): {}",
+        //     //         e
+        //     //     );
+        //     // }
+
+        //     let js_click_code = format!(
+        //         r#"
+        //             (() => {{
+        //                 const targetUrl = "{}";
+        //                 const relPath = "{}";
+        //                 const selector = "{}";
+
+        //                 // exact href 매칭 <a> 태그 검색
+        //                 let targetA = document.querySelector(`a[href="${{targetUrl}}"], a[href="${{relPath}}"]`);
+
+        //                 if (!targetA && selector) {{
+        //                     const el = document.querySelector(selector);
+        //                     if (el) targetA = el.tagName === 'A' ? el : el.closest('a');
+        //                 }}
+
+        //                 if (targetA) {{
+        //                     targetA.scrollIntoView({{ block: 'center', inline: 'center' }});
+        //                     targetA.click();
+        //                     return true;
+        //                 }}
+        //                 return false;
+        //             }})()
+        //             "#,
+        //         url, relative_path, item.selector
+        //     );
+
+        //     if let Ok(eval_res) = self.page.evaluate(&js_click_code).await {
+        //         // 💡 String 결과값을 직접 "true"와 비교
+        //         if eval_res.trim() == "true" {
+        //             println!(
+        //                 "🎯 [Exact Anchor Click] target_url('{}') 기반 exact DOM 클릭 성공",
+        //                 url
+        //             );
+        //             return Ok(format!("Exact Anchor Clicked for URL '{}'", url));
+        //         }
+        //     }
+        // }
+
+        // 💡 1. target_url이 존재하면 href 속성 셀렉터(a[href*='...'])를 직접 생성하여 exact click 시도
+        if let Some(ref url) = item.target_url {
+            let relative_path = if let Ok(parsed) = url::Url::parse(url) {
+                parsed.path().to_string()
+            } else {
+                url.to_string()
+            };
+
+            // target_url 경로를 이용한 exact attribute selector 구성
+            let href_selector = format!("a[href*='{}']", relative_path);
+
+            let js_click_code = format!(
+                r#"
+                        (() => {{
+                            const targetUrl = "{}";
+                            const relPath = "{}";
+                            const exactHrefSelector = "{}";
+
+                            // 1순위: a[href*='/i/xxx'] Exact Attribute Selector로 핀포인트 조화
+                            let targetA = document.querySelector(exactHrefSelector);
+
+                            // 2순위: 상대/절대 경로 직접 비교 Fallback
+                            if (!targetA) {{
+                                const anchors = Array.from(document.querySelectorAll('a'));
+                                targetA = anchors.find(a => {{
+                                    const href = a.getAttribute('href');
+                                    return href && (href === targetUrl || href === relPath || a.href === targetUrl);
+                                }});
+                            }}
+
+                            if (targetA) {{
+                                targetA.scrollIntoView({{ block: 'center', inline: 'center' }});
+
+                                const evt = new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }});
+                                targetA.dispatchEvent(evt);
+                                targetA.click();
+
+                                return "true";
+                            }}
+                            return "false";
+                        }})()
+                        "#,
+                url, relative_path, href_selector
+            );
+
+            if let Ok(eval_res) = self.page.evaluate(&js_click_code).await {
+                let clean_res = eval_res.trim().trim_matches('"');
+                if clean_res == "true" {
+                    println!(
+                        "🎯 [Exact Anchor Click] '{}' (URL: {}) 기반 exact DOM 클릭 성공",
+                        href_selector, url
+                    );
+                    return Ok(format!("Exact Anchor Clicked for URL '{}'", url));
+                }
+            }
+        }
+
+        // 💡 2. target_url 클릭 실패 또는 URL이 없는 경우 이 블록으로 옴
+        // - 좌표(center_x, center_y) 기반 하드웨어 마우스 클릭
+        println!(
+            "🎯 [Coordinate click] x, y : ({:.2}, {:.2}) \n",
+            item.center_x, item.center_y
+        );
+
+        self.page
+            .click_at_point(item.center_x, item.center_y)
+            .await?;
+
+        Ok(format!(
+            "🎯 Clicked at ({:.2}, {:.2}) for selector '{}'",
+            item.center_x, item.center_y, item.selector
+        ))
     }
 
     /// 결정된 Action을 수행하는 헬퍼 메서드 (Tool Calling과 비슷함)
@@ -993,70 +1184,68 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 }
             }
 
-            AgentAction::ClickElement { selector, x, y, .. } => {
-                println!("[Action] 좌표 기반 요소 클릭 시도: {}", selector);
+            AgentAction::ClickElement {
+                selector,
+                target_url,
+                x,
+                y,
+                reasoning: _,
+            } => {
                 let history_formatter = HistoryFormatter::new("click", "ClickElement", current_url);
 
-                // 1. x, y 좌표 결정 (액션에 명시되어 있지 않으면 obs.target_elements에서 룩업)
-                let target_point = if let (Some(px), Some(py)) = (x, y) {
-                    Some((*px, *py))
-                } else {
-                    obs.target_elements
-                        .iter()
-                        .find(|item| item.selector == *selector)
-                        .map(|item| (item.center_x, item.center_y))
-                };
+                // // 1. obs.target_elements에서 matching 되는 TargetItem 룩업 (없으면 임시 TargetItem 생성)
+                // let matched_item =
+                //     TargetItem::new(selector.to_string(), Some(target_url.clone()), x, y);
+                // 룩업을 하려면 id같은걸 element에 커스텀으로 추가해서 룩업하게 할까? 지금은 일단 받은 파라미터 값 그대로를 쓰기로 한다.
 
-                match target_point {
-                    Some((cx, cy)) => {
-                        println!(
-                            "🎯 [Coordinate Click] 좌표 ({}, {}) 로 마우스 클릭 발사",
-                            cx, cy
-                        );
+                // target build
+                let target = TargetItem::new(
+                    selector.to_string(),
+                    Some(target_url.clone()),
+                    x.unwrap_or(0.0),
+                    y.unwrap_or(0.0),
+                );
 
-                        // 2. 좌표 위치로 마우스 이동 및 클릭 이벤트 전송 (CDP Mouse Event)
-                        let click_result = self.page.click_at_point(cx, cy).await;
+                // 3. TargetItem 참조로 click_element_smart 호출
+                println!("[Action] 클릭 시도: {:?}", &target);
 
-                        match click_result {
-                            Ok(_) => {
-                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                // 2. TargetItem 참조로 click_element_smart 호출
+                match self.click_element_smart(&target).await {
+                    Ok(detail_msg) => {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
 
-                                let new_url = self
-                                    .page
-                                    .current_url()
-                                    .await
-                                    .unwrap_or_else(|_| current_url.clone());
+                        let new_url = self
+                            .page
+                            .current_url()
+                            .await
+                            .unwrap_or_else(|_| current_url.clone());
 
-                                println!("🔗 [Click Success] new updated URL: {}", new_url);
-                                let msg = history_formatter.format(
-                                    "success",
-                                    "Successfully clicked target coordinate",
-                                    &format!(
-                                        "Clicked at ({}, {}) for selector '{}'",
-                                        cx, cy, selector
-                                    ),
-                                );
-                                Ok((LoopControl::Continue, msg))
-                            }
-                            Err(e) => {
-                                eprintln!("Click Error at ({}, {}): {}", cx, cy, e);
-                                let msg = history_formatter.format(
-                                    "failed",
-                                    "Coordinate click failed",
-                                    &format!("Failed to click point ({}, {}): {}", cx, cy, e),
-                                );
-                                Ok((LoopControl::Continue, msg))
-                            }
+                        println!("🔗 [Click Success] new updated URL: {}", new_url);
+
+                        // 방문 기록 저장
+                        self.mark_visited(&new_url);
+                        if let Some(ref url) = target.target_url {
+                            self.mark_visited(url); // 이러면 2개씩 생기는 거 아닌가? ;
                         }
-                    }
-                    None => {
-                        eprintln!("⚠️ [Coordinate Miss] '{}' 에 해당하는 좌표를 target_elements에서 찾지 못함", selector);
+
                         let msg = history_formatter.format(
-                            "not_found",
-                            "Coordinate lookup failed",
+                            "success",
+                            "Successfully clicked target element",
+                            &detail_msg,
+                        );
+                        Ok((LoopControl::Continue, msg))
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Click Execution Error for selector '{}': {}",
+                            &target.selector, e
+                        );
+                        let msg = history_formatter.format(
+                            "failed",
+                            "Click element failed",
                             &format!(
-                                "Could not locate x, y coordinates for selector '{}'",
-                                selector
+                                "Failed to click element with selector '{}': {}",
+                                &target.selector, e
                             ),
                         );
                         Ok((LoopControl::Continue, msg))
@@ -1103,16 +1292,65 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         }
     }
 
+    pub async fn observe_current_page(&mut self) -> DynResult<AgentObservation> {
+        // 1. Observe: 스텝 시작 시 DOM, simpleified_dom 관측
+        // println!("📍 현재 위치 (debug): {}", self.page.current_url().await?);
+
+        // 💡 관측 전 최대 5초간 페이지 로드 완료 대기
+        lib::page::wait_for_page_load(self.page, 5).await?;
+        let agent_observation = self.capture_observation().await?;
+
+        // 2. 관찰 시점의 Simplified DOM 즉시 저장
+        if let Err(e) = self
+            .save_simplified_dom(
+                &agent_observation.current_url,
+                &agent_observation.simplified_dom,
+            )
+            .await
+        {
+            eprintln!("⚠️ [Run Observation DOM Save Warning] {}", e);
+        }
+
+        Ok(agent_observation)
+    }
+
     /// 메인 루프 실행 메서드
     pub async fn run(&mut self) -> DynResult<()> {
         let mut step = 1;
         loop {
             println!("\n=== Agent Step {} ===", step);
 
-            // 1. Observe: 스텝 시작 시 DOM, simpleified_dom 관측
-            // println!("📍 현재 위치 (debug): {}", self.page.current_url().await?);
+            let mut agent_observation = None;
+            let max_try = 3;
+            for attempt in 1..=max_try {
+                match self.observe_current_page().await {
+                    Ok(observation) => {
+                        agent_observation = Some(observation);
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "⚠️ [Observe Error] 페이지 관측 실패: {} ({}/{} 재시도 중...)",
+                            e, attempt, max_try
+                        );
+                    }
+                }
 
-            let agent_observation = self.capture_observation().await?;
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            }
+
+            // 💡 Shadowing: 변수 이름은 그대로 유지하면서 Option을 완전히 제거!
+            let agent_observation = match agent_observation {
+                Some(obs) => {
+                    println!("✅ [Observeation Success]");
+                    obs
+                }
+                None => {
+                    eprintln!("💥 페이지 관측(observeCurrentPage) 3회 연속 실패로 작업 종료");
+                    break;
+                }
+            };
+
             let current_url = &agent_observation.current_url;
             println!("📍 current url: {}", current_url);
             self.mark_visited(&current_url);
@@ -1120,17 +1358,6 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 println!("✅ [Visited Urls] Length: {}", self.visited_urls.len());
                 println!("Exiting due to visited urls length 50");
                 break;
-            }
-
-            // 2. 관찰 시점의 Simplified DOM 즉시 저장
-            if let Err(e) = self
-                .save_simplified_dom(
-                    &agent_observation.current_url,
-                    &agent_observation.simplified_dom,
-                )
-                .await
-            {
-                eprintln!("⚠️ [Run Observation DOM Save Warning] {}", e);
             }
 
             // 4. Think: LLM 추론 (최대 3회 재시도)

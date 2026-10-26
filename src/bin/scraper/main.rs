@@ -110,20 +110,50 @@ impl PageTrait for ChromiumPageAdapter {
     /// 지정한 (x, y) 좌표로 실제 하드웨어 마우스 커서를 이동하고 클릭을 수행합니다.
     async fn click_at_point(
         &self,
-        x: f64,
-        y: f64,
+        target_x: f64,
+        target_y: f64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let point = Point { x, y };
+        // 자연스러운 이동을 위한 프레임 스텝 분할 (예: 15스텝 동안 이동)
+        let steps = 15;
+        let duration_ms = 150; // 총 이동 시간 (150ms)
+        let step_delay = Duration::from_millis(duration_ms / steps);
 
-        let _ = self.page.evaluate(scroll_js).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // 임의의 출발점 (이전 좌표를 저장해두었다면 해당 좌표 사용 가능)
+        let start_x = target_x - 40.0;
+        let start_y = target_y - 40.0;
 
-        // 클릭
-        self.page.click(point).await?;
+        // 3. CDP Input.dispatchMouseEvent (mouseMoved) 스무스 스텝 이동
+        for i in 1..=steps {
+            let progress = i as f64 / steps as f64;
+
+            // Ease-Out 삼차 보간법 (자연스러운 감속 이동 연출)
+            let ease = 1.0 - (1.0 - progress).powi(3);
+
+            let curr_x = start_x + (target_x - start_x) * ease;
+            let curr_y = start_y + (target_y - start_y) * ease;
+
+            // CDP Native mouse move
+            self.page
+                .move_mouse(Point {
+                    x: curr_x,
+                    y: curr_y,
+                })
+                .await?;
+
+            tokio::time::sleep(step_delay).await;
+        }
+
+        // 4. 목적지 도착 후 물리 마우스 클릭
+        self.page
+            .click(Point {
+                x: target_x,
+                y: target_y,
+            })
+            .await?;
 
         println!(
             "🖱️ [Hardware Mouse Click] Successfully clicked at ({:.2}, {:.2})",
-            x, y
+            target_x, target_y
         );
         Ok(())
     }
