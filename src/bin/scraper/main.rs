@@ -204,7 +204,8 @@ async fn main() -> DynResult<()> {
     // 4. 새 페이지 생성 및 이동 테스트
     // https://www.coupang.com/np/campaigns/82
     // https://www.google.com/shopping?udm=28
-    let target_webpage = "https://cmsn.info";
+    // "https://cmsn.info";
+    let target_webpage = "https://www.google.com/shopping?udm=28";
     let page = browser.new_page(target_webpage).await?;
     page.wait_for_navigation().await?;
 
@@ -215,15 +216,15 @@ async fn main() -> DynResult<()> {
     // Goal prompt
     let llm_host = "http://localhost";
     let llm_port = 31434;
-    let llm_model = "qwen2.5:14b";
-    let system_prompt = format!("Run only maximum 150 Steps. You are an automated web agent and data extraction assistant.
+    let llm_model = "qwen2.5-coder:14b";
+    let system_prompt = format!("You are an automated web agent and data extraction assistant.
         Only from {} domain, crawl item pages. You navigate into each item detail routes, and then, **route back to the list**.
         If you are hitting same target_url for more than 3 steps, go back and navigate other pages.
-        If you have no interesting html selector in the page, go back page.
+        If you have no interesting html selector in the page, 1.scroll down 1000px, if still not, 2. go back page.
         [CRITICAL INSTRUCTION]
         -Never click external domain url. Only stuck into {} domain.
         -You MUST answer ALL queries EXCLUSIVELY in English.", target_webpage, target_webpage);
-    let page_observation_system_prompt = "navigate item href and links";
+    let page_observation_system_prompt = "item detail data div";
     // mut 키워드 사용
     let mut agent = WebAgent::new(
         llm_host,

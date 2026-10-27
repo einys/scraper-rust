@@ -4,6 +4,7 @@ use regex::Regex;
 use schemars::schema_for;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
@@ -101,7 +102,7 @@ pub enum AgentAction {
     ClickElement {
         reasoning: String,
         selector: String,
-        target_url: String,
+        target_url: Option<String>,
         x: Option<f64>,
         y: Option<f64>,
     },
@@ -161,7 +162,7 @@ impl AgentAction {
                 y,
                 ..
             } => format!(
-                "ClickElement(selector={}, url={} x={:?}, y={:?})",
+                "ClickElement(selector={}, url={:?} x={:?}, y={:?})",
                 selector, target_url, x, y
             ),
             AgentAction::Finish { reason, .. } => format!("Finish({})", reason),
@@ -286,10 +287,10 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
     pub fn is_visited(&self, url: &str) -> bool {
         let normalized = normalize_url(url);
         let is_visited = self.visited_urls.contains(&normalized);
-        println!(
-            "Debug: URL {:?} is visited: {} in {:?}",
-            url, is_visited, self.visited_urls
-        );
+        // println!(
+        //     "Debug: URL {:?} is visited: {} in {:?}",
+        //     url, is_visited, self.visited_urls
+        // );
         is_visited
     }
 
@@ -450,7 +451,10 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 }
             }
 
-            eprintln!("⚠️ [Selector Retry] 수집된 DOM 요소가 0개입니다. 셀렉터를 다시 추출합니다. ({}/{})",attempt, max_selector_retries);
+            eprintln!(
+                "⚠️ [Selector Retry] DOM element is 0. Selector retry... ({}/{})",
+                attempt, max_selector_retries
+            );
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         };
 
@@ -627,8 +631,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             .unwrap_or_else(|_| format!("{:#?}", focused_elem));
 
         println!(
-            "🔎 [DOM Elements Focused]:\n{}",
-            focused_elem_json.chars().take(500).collect::<String>()
+            "🔎 [DOM Elements Focused]:\n{} (...) \n ",
+            focused_elem_json.chars().take(1000).collect::<String>()
         );
 
         let current_user_prompt = format!(
@@ -702,73 +706,113 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             simplified_dom.len()
         );
 
-        // CSS selector prompt
-        let system_prompt = format!(
-            r#"
-            You are a precise CSS Selector extraction engine.
-            Task: Find important element selectors from HTML DOM tree.
-            Note: "{}"
-            Output format: Provide ONLY a valid JSON object matching this exact shape:
-            {{
-              "fields": {{
-                ... <field selectors, necessary for the Task>
-              }}
-            }}
-            [CSS Selector Rules]
-            - Keep selectors as short and clean as possible, while ensuring each selector uniquely identifies its target item without ambiguity.
-            - Prefer direct class/id or short structural jumps (e.g., `article a`, `a.group`, `.thumbnail-wrapper img`).
-            - ONLY return standard CSS selectors compatible with `document.querySelector`.
-            - NEVER use non-standard pseudo-elements (`::text`, `::attr(...)`, `:contains(...)`).
-            - DO NOT use Tailwind style classes (e.g., `max-[60px]`).
-            "#,
-            self.page_observation_system_prompt.trim()
+        // 1. String 분할 (예: 6000자 단위)
+        let chunk_size = 6000;
+        let dom_chunks = chunk_string(simplified_dom, chunk_size);
+        let total_chunks = dom_chunks.len();
+        println!(
+            "📦 [Chunk Processing] DOM 분할 완료: 총 {} 개 청크",
+            total_chunks
         );
 
-        let user_prompt = format!(
-            r#"
-            HTML DOM tree:
-                ---
-                {}
-                ---
-            "#,
-            simplified_dom.trim(),
+        let mut merged_selectors = SelectorSchema::default();
+
+        // 2. 각 청크를 순회하며 LLM에 쿼리
+        for (idx, chunk) in dom_chunks.iter().enumerate() {
+            println!(
+                "🪐 [LLM Chunk {}/{}] (len: {}) 셀렉터 추출 요청 중...",
+                idx + 1,
+                total_chunks,
+                chunk.len(),
+            );
+
+            // CSS selector prompt
+            let system_prompt = format!(
+                r#"
+                You are a precise CSS Selector extraction engine.
+                Task: Find CSS selectors from HTML DOM tree. "{}"
+                Output format: Provide ONLY a valid JSON object matching this exact shape:
+                {{
+                  "fields": {{
+                    ... <field selectors, fields necessary for the Task>
+                  }}
+                }}
+                [CSS Selector Rules]
+                - Keep selectors as short and clean as possible, while ensuring each selector uniquely identifies its target item without ambiguity.
+                - Prefer direct and short (e.g., `a[href=]`, `div[data-ved]`).
+                - ONLY return standard CSS selectors compatible with `document.querySelector`.
+                - NEVER use non-standard pseudo-elements (`::text`, `::attr(...)`, `:contains(...)`).
+                - DO NOT use Tailwind style classes (e.g., `max-[60px]`).
+                "#,
+                self.page_observation_system_prompt.trim()
+            );
+
+            let user_prompt = format!(
+                r#"
+                    HTML DOM tree:
+                        ---
+                        {}
+                        ---
+
+
+                    Output format:
+                    {{
+                      "fields": {{
+                        ... <field CSS selectors, necessary for the Task>
+                      }}
+                    }}
+                "#,
+                &simplified_dom.trim().chars().take(6000).collect::<String>(),
+            );
+
+            let spinner = ProgressBar::new_spinner();
+            spinner.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                    .unwrap()
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"]),
+            );
+            spinner.set_message("Waiting LLM to finish DOM element selection...\n");
+            spinner.enable_steady_tick(Duration::from_millis(100));
+
+            let request = GenerationRequest::new(self.model.clone(), user_prompt)
+                .system(system_prompt)
+                .format(FormatType::Json);
+            let llm_response = self.ollama.generate(request).await?;
+            let cleaned_json =
+                lib::page::parse_json_from_llm_response(llm_response.response.trim());
+
+            spinner.finish_with_message("Done!\n");
+
+            println!("Selector response: {:?}", cleaned_json);
+
+            // 2. JSON 파싱 (serde_json)
+            let parsed_schema: SelectorSchema =
+                serde_json::from_str(&cleaned_json).map_err(|e| {
+                    format!(
+                        "JSON Deserialization failed: {} | Failed for this data: {}",
+                        e, cleaned_json
+                    )
+                })?;
+
+            // 3. 파싱 결과를 메인 스키마에 병합
+            merged_selectors.merge(parsed_schema);
+        }
+
+        println!(
+            "✅ [Chunk Merge] 최종 병합된 셀렉터 필드 개수: {}",
+            merged_selectors.fields.len()
         );
-
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                .unwrap()
-                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"]),
-        );
-        spinner.set_message("Waiting LLM to finish DOM element selection...\n");
-        spinner.enable_steady_tick(Duration::from_millis(100));
-
-        let request = GenerationRequest::new(self.model.clone(), user_prompt)
-            .system(system_prompt)
-            .format(FormatType::Json);
-        let llm_response = self.ollama.generate(request).await?;
-        let cleaned_json = lib::page::parse_json_from_llm_response(llm_response.response.trim());
-
-        spinner.finish_with_message("Done!\n");
-
-        // 2. JSON 파싱 (serde_json)
-        let parsed_schema: SelectorSchema = serde_json::from_str(&cleaned_json).map_err(|e| {
-            format!(
-                "JSON Deserialization failed: {} | Failed for this data: {}",
-                e, cleaned_json
-            )
-        })?;
 
         // 3. 실제 DOM 수집 검증
-        let items = lib::page::get_target_items(self.page, &parsed_schema).await?;
+        let items = lib::page::get_target_items(self.page, &merged_selectors).await?;
         if items.is_empty() {
             // return Err(format!("Schema '{:?}' returned 0 items from DOM", parsed_schema).into());
             // just print error and pass emprty result
-            println!("Schema '{}' returned 0 items from DOM", parsed_schema);
+            println!("Schema '{}' returned 0 items from DOM", merged_selectors);
             return Ok(SelectorSchema::default());
         }
 
-        Ok(parsed_schema)
+        Ok(merged_selectors)
     }
 
     // selector로 선택된 Targetitems 의 목록이 너무 길면 llm이 환각을 일으키므로 5~6개 정도의 후보군으로 줄여주는 메서드
@@ -923,14 +967,14 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         //         url.to_string()
         //     };
 
-        //     // 시각화 요소 주입 (실패하더라도 클릭 본체 로직에 영향을 주지 않도록 에러 무시)
-        //     // ((현재 다른 위치에서 하는 중))
-        //     // if let Err(e) = lib::page::inject_visual_cursor(self.page).await {
-        //     //     eprintln!(
-        //     //         "⚠️ [Visual Cursor Warning] 커서 주입 실패 (계속 진행): {}",
-        //     //         e
-        //     //     );
-        //     // }
+        // 시각화 요소 주입 (실패하더라도 클릭 본체 로직에 영향을 주지 않도록 에러 무시)
+
+        if let Err(e) = lib::page::inject_visual_cursor(self.page).await {
+            eprintln!(
+                "⚠️ [Visual Cursor Warning] 커서 주입 실패 (계속 진행): {}",
+                e
+            );
+        }
 
         //     let js_click_code = format!(
         //         r#"
@@ -1201,7 +1245,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 // target build
                 let target = TargetItem::new(
                     selector.to_string(),
-                    Some(target_url.clone()),
+                    target_url.clone(),
                     x.unwrap_or(0.0),
                     y.unwrap_or(0.0),
                 );
@@ -1427,4 +1471,28 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         }
         Ok(())
     }
+}
+
+/// 문자열을 UTF-8 경계를 지키며 max_chars 길이 단위로 분할합니다.
+pub fn chunk_string(input: &str, max_chars: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::with_capacity(max_chars);
+    let mut char_count = 0;
+
+    for ch in input.chars() {
+        current_chunk.push(ch);
+        char_count += 1;
+
+        if char_count >= max_chars {
+            chunks.push(current_chunk);
+            current_chunk = String::with_capacity(max_chars);
+            char_count = 0;
+        }
+    }
+
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    chunks
 }

@@ -152,6 +152,23 @@ where
     Ok(clean_map)
 }
 
+impl SelectorSchema {
+    /// 다른 SelectorSchema의 fields를 현재 스키마에 병합합니다.
+    pub fn merge(&mut self, other: SelectorSchema) {
+        for (key, new_selector) in other.fields {
+            self.fields
+                .entry(key)
+                .and_modify(|existing| {
+                    // 이미 존재하는 키라면 중복 셀렉터가 아닐 때 쉼표(,)로 결합
+                    if !existing.contains(&new_selector) {
+                        *existing = format!("{}, {}", existing, new_selector);
+                    }
+                })
+                .or_insert(new_selector);
+        }
+    }
+}
+
 impl fmt::Display for SelectorSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match serde_json::to_string_pretty(self) {
@@ -198,8 +215,16 @@ pub fn sanitize_selector(selector: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TargetItem {
     pub selector: String,
+    // 💡 null이 들어와도 None으로 흡수
+    #[serde(default)]
     pub target_url: Option<String>, // 중복 체크 기준 (href 절대 경로)
+
+    // 💡 null이 들어와도 None으로 흡수
+    #[serde(default)]
     pub center_x: f64,
+
+    // 💡 null이 들어와도 None으로 흡수
+    #[serde(default)]
     pub center_y: f64,
 }
 
@@ -297,7 +322,11 @@ pub async fn get_target_items<P: PageTrait>(
     );
 
     let eval_res = page.evaluate(&js_code).await?;
-    let items: Vec<TargetItem> = serde_json::from_str(&eval_res)?;
+
+    // 💡 hex escape 에러를 방지하기 위해 붕 뜬 백슬래시 및 이스케이프 정제
+    let sanitized_json = eval_res.replace("\\x", "\\\\x"); // 단순 hex 문맥 완화
+
+    let items: Vec<TargetItem> = serde_json::from_str(&sanitized_json)?;
     Ok(items)
 }
 
