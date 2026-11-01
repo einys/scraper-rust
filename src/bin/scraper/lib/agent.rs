@@ -14,6 +14,7 @@ use tokio::fs;
 use crate::lib;
 use crate::lib::dyn_result::DynError;
 use crate::lib::dyn_result::DynResult;
+use crate::lib::page::BrowserTrait;
 use crate::lib::page::ExtractedContent;
 use crate::lib::page::ExtractedContentWrapper;
 use crate::lib::page::SelectorSchema;
@@ -46,8 +47,8 @@ impl<'a> HistoryFormatter<'a> {
     /// ActionHistory 표준 응답 문자열 포맷 생성
     fn format(&self, status: &str, reasoning: &str, data_payload: &str) -> String {
         format!(
-            "{{ step: \"{}\", action_name: \"{}\", status: \"{}\", current_url: \"{}\" }} <data>{}</data>",
-            self.step, self.action_name, status, self.current_url, data_payload
+            "{{ step: \"{}\", action_name: \"{}\", status: \"{}\", message: \"{}\", current_url: \"{}\" }} <data>{}</data>",
+            self.step, self.action_name, status, reasoning, self.current_url, data_payload
         )
     }
 }
@@ -121,7 +122,13 @@ pub enum AgentAction {
         // New variant for going back
         reasoning: String, // 👈 thinking process
     },
+    SelectTab {
+        url: String,
+        close_previous_tab: bool,
+        reasoning: String, // 👈 thinking process
+    },
 }
+
 impl AgentAction {
     // reasoning 필드만 쉽게 뽑아내는 헬퍼 메서드
     pub fn reasoning(&self) -> &str {
@@ -133,6 +140,11 @@ impl AgentAction {
             AgentAction::Finish { reasoning, .. } => reasoning,
             // AgentAction::ExtractData { reasoning, .. } => reasoning,
             AgentAction::BackPage { reasoning } => reasoning,
+            AgentAction::SelectTab {
+                url,
+                close_previous_tab,
+                reasoning,
+            } => reasoning,
         }
     }
 
@@ -146,6 +158,7 @@ impl AgentAction {
             AgentAction::Finish { .. } => "Finish",
             // AgentAction::ExtractData { .. } => "ExtractData",
             AgentAction::BackPage { .. } => "BackPage",
+            AgentAction::SelectTab { .. } => "SelectTab",
         }
     }
 
@@ -170,6 +183,14 @@ impl AgentAction {
             //     format!("ExtractData")
             // }
             AgentAction::BackPage { .. } => "BackPage".to_string(),
+            AgentAction::SelectTab {
+                url,
+                close_previous_tab,
+                ..
+            } => format!(
+                "SelectTab(url={:?}, close_previous_tab={})",
+                url, close_previous_tab
+            ),
         }
     }
 }
@@ -228,6 +249,13 @@ impl TargetItemWrapper {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ElementClickTarget {
+    found: bool,
+    x: f64,
+    y: f64,
+}
+
 /// URL 중복 체크 시 비교 정확도를 높이기 위한 정규화 헬퍼
 fn normalize_url(url: &str) -> String {
     url.trim_end_matches('/')
@@ -237,10 +265,11 @@ fn normalize_url(url: &str) -> String {
         .to_string()
 }
 
-pub struct WebAgent<'a, P: PageTrait> {
+pub struct WebAgent<'a, B: BrowserTrait> {
     ollama: Ollama,
     model: String,
-    page: &'a P,
+    browser: &'a B,
+    pub page: Box<dyn PageTrait>, // 💡 언제든 새 탭으로 교체 가능!,
     system_task_prompt: String,
     page_observation_system_prompt: String,
     // 💡 스텝별 행동 기록을 누적 보관하는 필드 추가
@@ -248,15 +277,18 @@ pub struct WebAgent<'a, P: PageTrait> {
     max_history_depth: usize, // 토큰 폭발 방지를 위한 최근 기록 유지 개수
     pub visited_urls: HashSet<String>,
     target_webpage: String,
+    pub last_mouse_x: f64,
+    pub last_mouse_y: f64,
 }
 
-impl<'a, P: PageTrait> WebAgent<'a, P> {
+impl<'a, B: BrowserTrait> WebAgent<'a, B> {
     /// Agent 생성자
     pub fn new(
         ollama_host: &str,
         ollama_port: u16,
         model: &str,
-        page: &'a P,
+        browser: &'a B,
+        page: Box<dyn PageTrait>,
         system_task_prompt: &str,
         page_element_target_description: &str,
         target_webpage: &str,
@@ -268,6 +300,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         Self {
             ollama,
             model: model.to_string(),
+            browser,
             page,
             system_task_prompt: system_task_prompt.to_string(),
             page_observation_system_prompt: page_element_target_description.to_string(),
@@ -275,6 +308,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
             max_history_depth: MAX_HISTORY_COUNT, // 기본적으로 최근 8개의 이전 스텝을 저장합니다.
             visited_urls: HashSet::new(),
             target_webpage: target_webpage.to_string(),
+            last_mouse_x: 500.0,
+            last_mouse_y: 400.0,
         }
     }
 
@@ -292,6 +327,12 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         //     url, is_visited, self.visited_urls
         // );
         is_visited
+    }
+
+    /// 마우스의 현재 마지막 위치 상태를 업데이트합니다.
+    pub fn update_last_mouse_pos(&mut self, x: f64, y: f64) {
+        self.last_mouse_x = x;
+        self.last_mouse_y = y;
     }
 
     // 💡 max_history_depth를 고려하여 오래된 history부터 제거하는 메소드 (FIFO 형식)
@@ -401,19 +442,19 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
         // 1. 새 탭 열림 무력화 JS 실행
-        let sanitize_js = r#"
-                (() => {
-                    document.querySelectorAll('a[target]').forEach(el => el.removeAttribute('target'));
-                    window.open = function(url) {
-                        if (url) { window.location.href = url; }
-                        return window;
-                    };
-                })();
-            "#;
-        let _ = self.page.evaluate(sanitize_js).await;
+        // let sanitize_js = r#"
+        //         (() => {
+        //             document.querySelectorAll('a[target]').forEach(el => el.removeAttribute('target'));
+        //             window.open = function(url) {
+        //                 if (url) { window.location.href = url; }
+        //                 return window;
+        //             };
+        //         })();
+        //     "#;
+        // let _ = self.page.evaluate(sanitize_js).await;
 
         // 2. 초기 Simplified DOM 캡처
-        let simplified_dom = crate::lib::page::get_simplified_dom_tree(self.page).await?;
+        let simplified_dom = crate::lib::page::get_simplified_dom_tree(&*self.page).await?;
         let html_content = self.page.content().await?;
 
         // 3. 셀렉터 추출 및 타겟 항목 수집 (최대 3회 재시도)
@@ -422,7 +463,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         let max_selector_retries = 3;
         let (selectors, target_elements) = loop {
             if let Ok(s) = self.ask_important_selectors(&simplified_dom).await {
-                if let Ok(items) = lib::page::get_target_items(self.page, &s).await {
+                if let Ok(items) = lib::page::get_target_items(&*self.page, &s).await {
                     if !items.is_empty() {
                         break (s, items); // 👈 루프 탈출과 동시에 튜플 반환!
                     }
@@ -441,7 +482,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 );
 
                 if let Ok(fallback_items) =
-                    lib::page::get_target_items(self.page, &fallback_schema).await
+                    lib::page::get_target_items(&*self.page, &fallback_schema).await
                 {
                     break (fallback_schema, fallback_items);
                 } else {
@@ -621,7 +662,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
 
         // user prompt (current state prompt) build
         let elem = match &obs.focused_selectors {
-            Some(schema) => lib::page::get_target_items(self.page, schema).await?,
+            Some(schema) => lib::page::get_target_items(&*self.page, schema).await?,
             None => Vec::new(),
         };
 
@@ -804,7 +845,7 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         );
 
         // 3. 실제 DOM 수집 검증
-        let items = lib::page::get_target_items(self.page, &merged_selectors).await?;
+        let items = lib::page::get_target_items(&*self.page, &merged_selectors).await?;
         if items.is_empty() {
             // return Err(format!("Schema '{:?}' returned 0 items from DOM", parsed_schema).into());
             // just print error and pass emprty result
@@ -956,136 +997,141 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
     /// TargetItem 정보를 바탕으로 target_url 기반 exact anchor 클릭을 시도하고,
     /// 실패 시 (center_x, center_y) 좌표로 CDP Native 마우스 이동 및 클릭을 수행합니다.
     pub async fn click_element_smart(
-        &self,
+        &mut self,
         item: &TargetItem,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // // 💡 1. target_url이 명시되어 있다면(Some이라면) DOM에서 해당 <a> 태그를 찾아 exact click 우선 시도
-        // if let Some(url) = &item.target_url {
-        //     let relative_path = if let Ok(parsed) = url::Url::parse(url) {
-        //         parsed.path().to_string()
-        //     } else {
-        //         url.to_string()
-        //     };
+        let mut click_x = item.center_x;
+        let mut click_y = item.center_y;
+        let mut click_mode = "Coordinate Fallback";
 
-        // 시각화 요소 주입 (실패하더라도 클릭 본체 로직에 영향을 주지 않도록 에러 무시)
+        // 1. 시작 좌표 (click_x, click_y) 결정 후
+        let start_x = Some(self.last_mouse_x);
+        let start_y = Some(self.last_mouse_y);
 
-        if let Err(e) = lib::page::inject_visual_cursor(self.page).await {
-            eprintln!(
-                "⚠️ [Visual Cursor Warning] 커서 주입 실패 (계속 진행): {}",
-                e
-            );
-        }
-
-        //     let js_click_code = format!(
-        //         r#"
-        //             (() => {{
-        //                 const targetUrl = "{}";
-        //                 const relPath = "{}";
-        //                 const selector = "{}";
-
-        //                 // exact href 매칭 <a> 태그 검색
-        //                 let targetA = document.querySelector(`a[href="${{targetUrl}}"], a[href="${{relPath}}"]`);
-
-        //                 if (!targetA && selector) {{
-        //                     const el = document.querySelector(selector);
-        //                     if (el) targetA = el.tagName === 'A' ? el : el.closest('a');
-        //                 }}
-
-        //                 if (targetA) {{
-        //                     targetA.scrollIntoView({{ block: 'center', inline: 'center' }});
-        //                     targetA.click();
-        //                     return true;
-        //                 }}
-        //                 return false;
-        //             }})()
-        //             "#,
-        //         url, relative_path, item.selector
-        //     );
-
-        //     if let Ok(eval_res) = self.page.evaluate(&js_click_code).await {
-        //         // 💡 String 결과값을 직접 "true"와 비교
-        //         if eval_res.trim() == "true" {
-        //             println!(
-        //                 "🎯 [Exact Anchor Click] target_url('{}') 기반 exact DOM 클릭 성공",
-        //                 url
-        //             );
-        //             return Ok(format!("Exact Anchor Clicked for URL '{}'", url));
-        //         }
-        //     }
-        // }
-
-        // 💡 1. target_url이 존재하면 href 속성 셀렉터(a[href*='...'])를 직접 생성하여 exact click 시도
+        // 💡 1. target_url이 존재하면 뷰포트 상의 실시간 Exact Anchor 좌표(x, y) 우선 추출
         if let Some(ref url) = item.target_url {
-            let relative_path = if let Ok(parsed) = url::Url::parse(url) {
-                parsed.path().to_string()
-            } else {
-                url.to_string()
+            let relative_path = match url::Url::parse(url) {
+                Ok(parsed) => parsed.path().to_string(),
+                Err(_) => url.to_string(),
             };
 
-            // target_url 경로를 이용한 exact attribute selector 구성
             let href_selector = format!("a[href*='{}']", relative_path);
 
-            let js_click_code = format!(
+            let js_locate_code = format!(
                 r#"
-                        (() => {{
-                            const targetUrl = "{}";
-                            const relPath = "{}";
-                            const exactHrefSelector = "{}";
+                    (() => {{
+                        const targetUrl = "{}";
+                        const relPath = "{}";
+                        const selector = "{}";
 
-                            // 1순위: a[href*='/i/xxx'] Exact Attribute Selector로 핀포인트 조화
-                            let targetA = document.querySelector(exactHrefSelector);
+                        let el = document.querySelector(selector);
+                        if (!el) {{
+                            const anchors = Array.from(document.querySelectorAll('a'));
+                            el = anchors.find(a => {{
+                                const href = a.getAttribute('href');
+                                return href && (href === targetUrl || href === relPath || a.href === targetUrl);
+                            }});
+                        }}
 
-                            // 2순위: 상대/절대 경로 직접 비교 Fallback
-                            if (!targetA) {{
-                                const anchors = Array.from(document.querySelectorAll('a'));
-                                targetA = anchors.find(a => {{
-                                    const href = a.getAttribute('href');
-                                    return href && (href === targetUrl || href === relPath || a.href === targetUrl);
-                                }});
-                            }}
+                        if (el) {{
+                            el.scrollIntoView({{ block: 'center', inline: 'center' }});
+                            const rect = el.getBoundingClientRect();
+                            return JSON.stringify({{
+                                found: true,
+                                x: rect.left + rect.width / 2,
+                                y: rect.top + rect.height / 2
+                            }});
+                        }}
 
-                            if (targetA) {{
-                                targetA.scrollIntoView({{ block: 'center', inline: 'center' }});
-
-                                const evt = new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }});
-                                targetA.dispatchEvent(evt);
-                                targetA.click();
-
-                                return "true";
-                            }}
-                            return "false";
-                        }})()
-                        "#,
+                        return JSON.stringify({{ found: false, x: 0.0, y: 0.0 }});
+                    }})()
+                    "#,
                 url, relative_path, href_selector
             );
 
-            if let Ok(eval_res) = self.page.evaluate(&js_click_code).await {
-                let clean_res = eval_res.trim().trim_matches('"');
-                if clean_res == "true" {
-                    println!(
-                        "🎯 [Exact Anchor Click] '{}' (URL: {}) 기반 exact DOM 클릭 성공",
-                        href_selector, url
-                    );
-                    return Ok(format!("Exact Anchor Clicked for URL '{}'", url));
+            // 💡 evaluate가 String을 반환하므로 serde_json::from_str 사용
+            if let Ok(eval_res) = self.page.evaluate(&js_locate_code).await {
+                // JS에서 JSON.stringify로 넘어온 문자열 이스케이프 정제
+                let clean_json = eval_res.trim().trim_matches('"').replace("\\\"", "\"");
+                if let Ok(target) = serde_json::from_str::<ElementClickTarget>(&clean_json) {
+                    if target.found {
+                        click_x = target.x;
+                        click_y = target.y;
+                        click_mode = "Exact Anchor";
+                    }
                 }
             }
         }
 
-        // 💡 2. target_url 클릭 실패 또는 URL이 없는 경우 이 블록으로 옴
-        // - 좌표(center_x, center_y) 기반 하드웨어 마우스 클릭
+        // 💡 2. 단일 흐름 (Single Execution Path): 마우스 이동 및 CDP Native 클릭
         println!(
-            "🎯 [Coordinate click] x, y : ({:.2}, {:.2}) \n",
-            item.center_x, item.center_y
+            "🎯 [{}] Target 좌표: ({:.2}, {:.2}) (Selector: '{}')",
+            click_mode, click_x, click_y, item.selector
         );
 
-        self.page
-            .click_at_point(item.center_x, item.center_y)
-            .await?;
+        // 마우스 커서 이동 (비치명적 에러 무시)
+        if let Err(e) = self
+            .page
+            .move_cursor_at(click_x, click_y, start_x, start_y)
+            .await
+        {
+            eprintln!("⚠️ [Cursor Move Error] 커서 이동 실패 (무시): {}", e);
+        }
+
+        // 2. 이동 완료 후 마우스 현재 위치 업데이트
+        // (self가 &mut self이거나 Mutex/Cell 형태인 경우 위치 저장)
+        self.update_last_mouse_pos(click_x, click_y);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // CDP Native 클릭
+        self.page.click_at_point(click_x, click_y).await?;
 
         Ok(format!(
-            "🎯 Clicked at ({:.2}, {:.2}) for selector '{}'",
-            item.center_x, item.center_y, item.selector
+            "🎯 [{}] Successfully clicked at ({:.2}, {:.2})",
+            click_mode, click_x, click_y
         ))
+    }
+
+    // // 3. 현재 탭을 제외한 나머지 모든 탭 닫기
+    // async fn close_other_tabs(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    //     let pages = self.browser.pages().await?;
+    //     let current_target_id = self.page.current_url().await?;
+    //     let mut closed_count = 0;
+
+    //     for page in pages {
+    //         // 현재 탭의 Target ID와 다른 탭들만 종료
+    //         if page.current_url().await? != current_target_id {
+    //             if let Ok(_) = page.close().await {
+    //                 closed_count += 1;
+    //             }
+    //         }
+    //     }
+
+    //     Ok(closed_count)
+    // }
+    //
+    pub async fn tab_focus(
+        &mut self,
+        url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 1. 브라우저 레벨에서 해당 탭을 최전면(Front)으로 가져옴
+        self.browser.go_to_tab(url).await?;
+
+        // 2. 💡 핵심: 해당 URL을 소유한 새 Page 핸들을 구해서 self.page를 업데이트!
+        let new_page_handle = self
+            .browser
+            .get_page_by_url(url)
+            .await?
+            .ok_or_else(|| format!("No active tab found for URL: {}", url))?;
+
+        self.page = new_page_handle;
+
+        println!(
+            "🎯 [Tab Focus & Page Swapped] Now self.page points to: {}",
+            url
+        );
+        Ok(())
     }
 
     /// 결정된 Action을 수행하는 헬퍼 메서드 (Tool Calling과 비슷함)
@@ -1094,7 +1140,9 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         action: &AgentAction,
         obs: &AgentObservation,
     ) -> DynResult<(LoopControl, String)> {
-        let current_url = &obs.current_url;
+        let url_location_before_action = &obs.current_url;
+        // 1. 클릭 전 탭 목록 수집
+        let tabs_before = self.browser.get_tab_list().await.unwrap_or_default();
 
         match action {
             // AgentAction::ExtractData { .. } => {
@@ -1144,7 +1192,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 self.clean_history_data();
 
                 println!("[Action] 파일 읽기 실행: {}", filename);
-                let history_formatter = HistoryFormatter::new("read", "ReadFile", current_url);
+                let history_formatter =
+                    HistoryFormatter::new("read", "ReadFile", url_location_before_action);
 
                 if !Path::new(filename).exists() {
                     let msg = history_formatter.format(
@@ -1177,7 +1226,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 filename, content, ..
             } => {
                 println!("[Action] 파일 쓰기 실행: {}", filename);
-                let history_formatter = HistoryFormatter::new("write", "WriteFile", current_url);
+                let history_formatter =
+                    HistoryFormatter::new("write", "WriteFile", url_location_before_action);
 
                 match tokio::fs::write(filename, content).await {
                     Ok(_) => {
@@ -1200,7 +1250,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
 
             AgentAction::ScrollPage { dy, .. } => {
                 println!("[Action] 페이지 스크롤: dy={}", dy);
-                let history_formatter = HistoryFormatter::new("scroll", "ScrollPage", current_url);
+                let history_formatter =
+                    HistoryFormatter::new("scroll", "ScrollPage", url_location_before_action);
 
                 let eval_result = self
                     .page
@@ -1235,7 +1286,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 y,
                 reasoning: _,
             } => {
-                let history_formatter = HistoryFormatter::new("click", "ClickElement", current_url);
+                let history_formatter =
+                    HistoryFormatter::new("click", "ClickElement", url_location_before_action);
 
                 // // 1. obs.target_elements에서 matching 되는 TargetItem 룩업 (없으면 임시 TargetItem 생성)
                 // let matched_item =
@@ -1262,22 +1314,62 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                             .page
                             .current_url()
                             .await
-                            .unwrap_or_else(|_| current_url.clone());
-
-                        println!("🔗 [Click Success] new updated URL: {}", new_url);
+                            .unwrap_or_else(|_| url_location_before_action.clone());
 
                         // 방문 기록 저장
                         self.mark_visited(&new_url);
-                        if let Some(ref url) = target.target_url {
-                            self.mark_visited(url); // 이러면 2개씩 생기는 거 아닌가? ;
-                        }
 
-                        let msg = history_formatter.format(
-                            "success",
-                            "Successfully clicked target element",
-                            &detail_msg,
-                        );
-                        Ok((LoopControl::Continue, msg))
+                        // 3. 클릭 후 탭 목록 수집
+                        let tabs_after = self.browser.get_tab_list().await.unwrap_or_default();
+
+                        // 3. 기존 목록에 없던 새로운 URL(새 탭) 찾기 (주의: 하나만 찾음. 여러 탭이 열렸을 경우 처리 필요함.)
+                        let newly_opened_url =
+                            tabs_after.iter().find(|url| !tabs_before.contains(url));
+                        if let Some(new_url) = newly_opened_url {
+                            println!("🔗 [Click Success] new updated URL: {}", new_url);
+
+                            // 탭 포커스 전환 시도 및 에러 처리
+                            let msg = match self.tab_focus(new_url).await {
+                                Ok(_) => {
+                                    println!(
+                                        "🎯 [Tab Focus Success] Switched focus to: {}",
+                                        new_url
+                                    );
+                                    history_formatter.format(
+                                            "success",
+                                            &format!(
+                                                "Successfully clicked target element and **opened new tab**. Switched focus to: {}",
+                                                new_url
+                                            ),
+                                            &detail_msg,
+                                        )
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                            "⚠️ [Tab Focus Warning] Failed to switch focus to tab '{}': {}",
+                                            new_url, e
+                                        );
+                                    // 포커스 전환에 실패하더라도 루프를 깨지 않고 상황을 History에 정확히 남김
+                                    history_formatter.format(
+                                            "warning",
+                                            &format!(
+                                                "Clicked element and opened new tab, but **failed to switch focus** to '{}': {}",
+                                                new_url,
+                                                e
+                                            ),
+                                            &detail_msg,
+                                        )
+                                }
+                            };
+                            Ok((LoopControl::Continue, msg))
+                        } else {
+                            let msg = history_formatter.format(
+                                "success",
+                                "Successfully clicked target element",
+                                &detail_msg,
+                            );
+                            Ok((LoopControl::Continue, msg))
+                        }
                     }
                     Err(e) => {
                         eprintln!(
@@ -1299,7 +1391,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
 
             AgentAction::BackPage { .. } => {
                 println!("[Action] 이전 페이지 이동 (BackPage)");
-                let history_formatter = HistoryFormatter::new("back", "BackPage", current_url);
+                let history_formatter =
+                    HistoryFormatter::new("back", "BackPage", url_location_before_action);
 
                 match self.page.go_back().await {
                     Ok(_) => {
@@ -1322,9 +1415,29 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
                 }
             }
 
+            AgentAction::SelectTab {
+                url,
+                close_previous_tab,
+                reasoning,
+            } => {
+                println!("[Action] 탭 선택: {}", url);
+                let history_formatter = HistoryFormatter::new("select_tab", "Select Tab", url);
+
+                self.browser.go_to_tab(url).await?;
+
+                let msg = history_formatter.format(
+                    "success",
+                    "Tab selected",
+                    &format!("Tab selected with URL: {}", url),
+                );
+
+                Ok((LoopControl::Continue, msg))
+            }
+
             AgentAction::Finish { reason, .. } => {
                 println!("[Action] 작업 완료: {}", reason);
-                let history_formatter = HistoryFormatter::new("finish", "Finish", current_url);
+                let history_formatter =
+                    HistoryFormatter::new("finish", "Finish", url_location_before_action);
                 let msg = history_formatter.format(
                     "success",
                     "Task completed",
@@ -1341,8 +1454,15 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         // println!("📍 현재 위치 (debug): {}", self.page.current_url().await?);
 
         // 💡 관측 전 최대 5초간 페이지 로드 완료 대기
-        lib::page::wait_for_page_load(self.page, 5).await?;
+        lib::page::wait_for_page_load(&*self.page, 5).await?;
         let agent_observation = self.capture_observation().await?;
+
+        if let Err(e) = lib::page::inject_visual_cursor(&*self.page).await {
+            eprintln!(
+                "⚠️ [Visual Cursor Warning] 커서 주입 실패 (계속 진행): {}",
+                e
+            );
+        }
 
         // 2. 관찰 시점의 Simplified DOM 즉시 저장
         if let Err(e) = self

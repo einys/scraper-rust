@@ -20,6 +20,19 @@ pub trait ElementTrait: Send + Sync {
 }
 
 #[async_trait]
+pub trait BrowserTrait: Send + Sync {
+    /// 1. 현재 브라우저 세션에 열려있는 모든 탭의 URL 목록 반환
+    async fn get_tab_list(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn get_page_by_url(&self, url: &str) -> DynResult<Option<Box<dyn PageTrait>>>;
+    /// 2. 지정한 URL을 가진 탭을 찾아 닫음
+    async fn close_tab(&self, url: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// 4. 지정한 URL을 가진 탭으로 전환 (해당 탭을 활성화)
+    async fn go_to_tab(&self, url: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[async_trait]
 pub trait PageTrait: Send + Sync {
     async fn evaluate(&self, script: &str) -> DynResult<String>;
     async fn find_element(&self, selector: &str) -> DynResult<Box<dyn ElementTrait>>;
@@ -29,6 +42,16 @@ pub trait PageTrait: Send + Sync {
     async fn navigate(&self, url: &str) -> DynResult<()>;
     async fn screenshot(&self) -> DynResult<Vec<u8>>;
     async fn click_at_point(&self, x: f64, y: f64) -> DynResult<()>;
+    async fn move_cursor_at(
+        &self,
+        x: f64,
+        y: f64,
+        start_x: Option<f64>,
+        start_y: Option<f64>,
+    ) -> DynResult<()>;
+    async fn wait_for_element(&self, selector: &str, timeout: Option<Duration>) -> DynResult<()>;
+    async fn goto(&self, url: &str) -> DynResult<()>;
+    async fn close(&self) -> DynResult<()>;
 }
 
 // ============================================================================
@@ -249,7 +272,7 @@ impl TargetItem {
     }
 }
 
-pub async fn get_target_items<P: PageTrait>(
+pub async fn get_target_items<P: PageTrait + ?Sized>(
     page: &P,
     schema: &SelectorSchema,
 ) -> Result<Vec<TargetItem>, DynError> {
@@ -344,7 +367,7 @@ pub fn parse_json_from_llm_response(raw_response: &str) -> String {
 // DOM Simplifier & Offline Parser
 // ============================================================================
 
-pub async fn get_simplified_dom_tree<P: PageTrait>(page: &P) -> Result<String, DynError> {
+pub async fn get_simplified_dom_tree<P: PageTrait + ?Sized>(page: &P) -> Result<String, DynError> {
     let js_script = r#"
         (() => {
             const listContainers = document.querySelectorAll(
@@ -499,7 +522,7 @@ fn parse_field_value(field_name: &str, element: &ElementRef) -> String {
     }
 }
 
-pub async fn inject_visual_cursor<P: PageTrait>(page: &P) -> DynResult<()> {
+pub async fn inject_visual_cursor<P: PageTrait + ?Sized>(page: &P) -> DynResult<()> {
     let js_code = r#"
     (() => {
         if (document.getElementById('agent-visual-cursor')) return;
@@ -562,7 +585,7 @@ pub async fn inject_visual_cursor<P: PageTrait>(page: &P) -> DynResult<()> {
 }
 
 /// 페이지의 document.readyState가 'complete'가 될 때까지 최대 timeout_secs 동안 대기합니다.
-pub async fn wait_for_page_load<P: PageTrait>(
+pub async fn wait_for_page_load<P: PageTrait + ?Sized>(
     page: &P,
     timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

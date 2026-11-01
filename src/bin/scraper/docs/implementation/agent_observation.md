@@ -36,17 +36,8 @@ impl<'a, P: PageTrait> WebAgent<'a, P> {
         let current_url = self.page.url().await.unwrap_or_default();
         println!("👀 Observing page {}...", current_url);
 
-        // 1. 새 탭 열림 무력화 JS 실행
-        let sanitize_js = r#"
-            (() => {
-                document.querySelectorAll('a[target]').forEach(el => el.removeAttribute('target'));
-                window.open = function(url) {
-                    if (url) { window.location.href = url; }
-                    return window;
-                };
-            })();
-        "#;
-        let _ = self.page.evaluate(sanitize_js).await;
+        // 1. 새 탭 열림 무력화 JS 실행. 원본이 hard navigation 요청인 경우, 새 탭은 안 열리되, 서버에 SPA로그가 아니라 hard navigation 로그가 찍히도록 보정함.
+
 
         // 2. Simplified DOM 및 Raw Content 수집
         let simplified_dom = crate::lib::page::get_simplified_dom_tree(self.page).await?;
