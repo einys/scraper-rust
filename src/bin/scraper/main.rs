@@ -334,13 +334,13 @@ async fn main() -> DynResult<()> {
     let llm_host = "http://localhost";
     let llm_port = 31434;
     let llm_model = "qwen2.5-coder:14b";
-    let system_prompt = format!("You are an automated web agent using your browser.
-        Only from {} domain, crawl item pages. You can navigate into each item detail routes, and then, find a proper way(go back or select tab) to return to the list page, to find other items.
-        If you are hitting same target_url for more than 3 steps, find the other route, navigate other pages.
-        If you have no interesting html selector in the page, 1.scroll down 1000px, if still not, 2. go back to list or select the browser tab.
-        [CRITICAL INSTRUCTION]
-        -Never click external domain url. Only stuck into {} domain.
-        -You MUST answer ALL queries EXCLUSIVELY in English.", target_webpage, target_webpage);
+    let system_prompt = format!("You are an automated web agent and data extraction assistant.
+            Only from {} domain, crawl 50 item pages. You navigate into each item detail routes, and then, **route back to the list**.
+            If you are hitting same target_url for more than 3 steps, go back and navigate other pages.
+            If you have no interesting html selector in the page, go back and navigate other pages.
+            [CRITICAL INSTRUCTION]
+            -Never click external domain url. Only stuck into {} domain.
+            -You MUST answer ALL queries EXCLUSIVELY in English.", target_webpage, target_webpage);
     let page_observation_system_prompt = "item detail data div";
     // mut 키워드 사용
     let mut agent = WebAgent::new(

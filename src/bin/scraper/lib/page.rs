@@ -522,17 +522,23 @@ fn parse_field_value(field_name: &str, element: &ElementRef) -> String {
     }
 }
 
-pub async fn inject_visual_cursor<P: PageTrait + ?Sized>(page: &P) -> DynResult<()> {
-    let js_code = r#"
-    (() => {
+pub async fn inject_visual_cursor<P: PageTrait + ?Sized>(
+    page: &P,
+    x: Option<f64>,
+    y: Option<f64>,
+) -> DynResult<()> {
+    let start_x = x.unwrap_or_default();
+    let start_y = y.unwrap_or_default();
+    let js_code = format!(
+        r#"
+    ((startX, startY) => {{
         if (document.getElementById('agent-visual-cursor')) return;
 
-        // 1. 빨간색 마우스 커서 포인터 생성
         const cursor = document.createElement('div');
         cursor.id = 'agent-visual-cursor';
         cursor.style.position = 'fixed';
-        cursor.style.top = '0';
-        cursor.style.left = '0';
+        cursor.style.top = `${{startY}}px`;
+        cursor.style.left = `${{startX}}px`;
         cursor.style.width = '14px';
         cursor.style.height = '14px';
         cursor.style.backgroundColor = 'rgba(255, 0, 0, 0.85)';
@@ -544,18 +550,16 @@ pub async fn inject_visual_cursor<P: PageTrait + ?Sized>(page: &P) -> DynResult<
         cursor.style.boxShadow = '0 0 8px rgba(255, 0, 0, 0.8)';
         document.body.appendChild(cursor);
 
-        // 2. 마우스 이동 이벤트 감지 시 커서 위치 업데이트
-        window.addEventListener('mousemove', (e) => {
-            cursor.style.left = `${e.clientX - 7}px`;
-            cursor.style.top = `${e.clientY - 7}px`;
-        });
+        window.addEventListener('mousemove', (e) => {{
+            cursor.style.left = `${{e.clientX - 7}}px`;
+            cursor.style.top = `${{e.clientY - 7}}px`;
+        }});
 
-        // 3. 클릭 시 핑(Ripple) 이펙트 애니메이션 생성
-        window.addEventListener('click', (e) => {
+        window.addEventListener('click', (e) => {{
             const ripple = document.createElement('div');
             ripple.style.position = 'fixed';
-            ripple.style.left = `${e.clientX - 15}px`;
-            ripple.style.top = `${e.clientY - 15}px`;
+            ripple.style.left = `${{e.clientX - 15}}px`;
+            ripple.style.top = `${{e.clientY - 15}}px`;
             ripple.style.width = '30px';
             ripple.style.height = '30px';
             ripple.style.border = '3px solid #ff0055';
@@ -566,21 +570,22 @@ pub async fn inject_visual_cursor<P: PageTrait + ?Sized>(page: &P) -> DynResult<
             document.body.appendChild(ripple);
 
             setTimeout(() => ripple.remove(), 500);
-        });
+        }});
 
-        // 4. Ripple 애니메이션 CSS 주입
         const style = document.createElement('style');
         style.textContent = `
-            @keyframes agent-ripple {
-                0% { transform: scale(0.5); opacity: 1; }
-                100% { transform: scale(2.5); opacity: 0; }
-            }
+            @keyframes agent-ripple {{
+                0% {{ transform: scale(0.5); opacity: 1; }}
+                100% {{ transform: scale(2.5); opacity: 0; }}
+            }}
         `;
         document.head.appendChild(style);
-    })();
-    "#;
+    }})({0}, {1});
+    "#,
+        start_x, start_y
+    );
 
-    page.evaluate(js_code).await?;
+    page.evaluate(&js_code).await?;
     Ok(())
 }
 

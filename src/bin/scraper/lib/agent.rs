@@ -78,16 +78,6 @@ fn default_scroll_dy() -> i32 {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", content = "params")]
 pub enum AgentAction {
-    /// 파일을 읽어옵니다.
-    #[serde(alias = "read", alias = "read_file", alias = "Read")]
-    ReadFile { reasoning: String, filename: String },
-    /// 파일에 텍스트 내용을 쓰거나 추가합니다.
-    #[serde(alias = "write", alias = "write_file", alias = "Write")]
-    WriteFile {
-        reasoning: String, // 👈 생각 과정 추가
-        filename: String,
-        content: String,
-    },
     /// 수직으로 페이지를 스크롤합니다.
     #[serde(alias = "scroll", alias = "scroll_page", alias = "Scroll")]
     ScrollPage {
@@ -113,19 +103,13 @@ pub enum AgentAction {
         reasoning: String, // 👈 생각 과정 추가
         reason: String,
     },
-    /// DOM에서 원하는 셀렉터 목록으로 데이터를 추출합니다.
-    // #[serde(alias = "extract", alias = "extract_data", alias = "Extract")]
-    // ExtractData { reasoning: String },
-    /// go back to the previous page.
+
+    /// go back to the previous page. \n [CRITICAL RULE] When returning from an item detail page opened in a NEW TAB, the browser history is empty. You MUST provide the 'backpage_target_url' parameter (e.g., the URL of the list page you came from). If you omit this parameter, the agent will crash.
     #[serde(alias = "back", alias = "back_page", alias = "Back")]
     BackPage {
         // New variant for going back
         reasoning: String, // 👈 thinking process
-    },
-    SelectTab {
-        url: String,
-        close_previous_tab: bool,
-        reasoning: String, // 👈 thinking process
+        backpage_target_url: Option<String>,
     },
 }
 
@@ -133,40 +117,28 @@ impl AgentAction {
     // reasoning 필드만 쉽게 뽑아내는 헬퍼 메서드
     pub fn reasoning(&self) -> &str {
         match self {
-            AgentAction::ReadFile { reasoning, .. } => reasoning,
-            AgentAction::WriteFile { reasoning, .. } => reasoning,
             AgentAction::ScrollPage { reasoning, .. } => reasoning,
             AgentAction::ClickElement { reasoning, .. } => reasoning,
             AgentAction::Finish { reasoning, .. } => reasoning,
             // AgentAction::ExtractData { reasoning, .. } => reasoning,
-            AgentAction::BackPage { reasoning } => reasoning,
-            AgentAction::SelectTab {
-                url,
-                close_previous_tab,
-                reasoning,
-            } => reasoning,
+            AgentAction::BackPage { reasoning, .. } => reasoning,
         }
     }
 
     /// 액션 이름(enum variant 이름)을 반환하는 헬퍼 메서드
     pub fn name(&self) -> &'static str {
         match self {
-            AgentAction::ReadFile { .. } => "ReadFile",
-            AgentAction::WriteFile { .. } => "WriteFile",
             AgentAction::ScrollPage { .. } => "ScrollPage",
             AgentAction::ClickElement { .. } => "ClickElement",
             AgentAction::Finish { .. } => "Finish",
             // AgentAction::ExtractData { .. } => "ExtractData",
             AgentAction::BackPage { .. } => "BackPage",
-            AgentAction::SelectTab { .. } => "SelectTab",
         }
     }
 
     /// 히스토리에 기록할 주요 파라미터 요약 정보
     pub fn to_string(&self) -> String {
         match self {
-            AgentAction::ReadFile { filename, .. } => format!("ReadFile({})", filename),
-            AgentAction::WriteFile { filename, .. } => format!("WriteFile({})", filename),
             AgentAction::ScrollPage { dy, .. } => format!("ScrollPage(dy={})", dy),
             AgentAction::ClickElement {
                 selector,
@@ -183,14 +155,6 @@ impl AgentAction {
             //     format!("ExtractData")
             // }
             AgentAction::BackPage { .. } => "BackPage".to_string(),
-            AgentAction::SelectTab {
-                url,
-                close_previous_tab,
-                ..
-            } => format!(
-                "SelectTab(url={:?}, close_previous_tab={})",
-                url, close_previous_tab
-            ),
         }
     }
 }
@@ -623,10 +587,7 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
         let action_guide = self.build_compact_action_guide();
 
         println!("LLM에 다음 단계를 추론하도록 요청합니다.");
-        println!(
-            "목록에 포함된 Actions List:\n{}...",
-            action_guide.chars().take(200).collect::<String>()
-        );
+        println!("목록에 포함된 Actions List:\n{}...", action_guide);
         println!("[History]\n{}", self.history_to_string());
         println!("[Visited Urls]\n{:?}", self.visited_urls);
 
@@ -676,6 +637,10 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
             focused_elem_json.chars().take(1000).collect::<String>()
         );
 
+        // opened tab list
+        let tabs = self.browser.get_tab_list().await?;
+        let tabs_str = tabs.join("\n- "); // 목록 형태로 가독성 향상
+
         let current_user_prompt = format!(
             "
             [Your Action History] (Recent)
@@ -684,6 +649,9 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
             [Your Current Route Location]
             {}
 
+            [Your Browser Tab List]
+            - {}
+
             [Current DOM elements]
             {}
 
@@ -691,6 +659,7 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
             Choose the next Action schema in JSON.",
             self.history_to_string(),
             obs.current_url,
+            tabs_str,
             focused_elem_json,
         );
 
@@ -1141,113 +1110,8 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
         obs: &AgentObservation,
     ) -> DynResult<(LoopControl, String)> {
         let url_location_before_action = &obs.current_url;
-        // 1. 클릭 전 탭 목록 수집
-        let tabs_before = self.browser.get_tab_list().await.unwrap_or_default();
 
         match action {
-            // AgentAction::ExtractData { .. } => {
-            //     // 추출 전 기존 데이터는 잊어버리도록 함
-            //     self.clean_history_data();
-
-            //     println!("[Action] 데이터 추출 실행:");
-            //     let history_formatter =
-            //         HistoryFormatter::new("extract", "ExtractData", current_url);
-
-            //     let (extracted_data, is_cached) =
-            //         match self.try_extract_with_cached_selectors(current_url).await {
-            //             Ok(Some(data)) => (data, true),
-            //             _ => {
-            //                 let selectors = self.extract_selectors(&obs.simplified_dom).await?;
-            //                 let data = crate::lib::page::extract_data_with_selectors(
-            //                     self.page, &selectors,
-            //                 )
-            //                 .await?;
-            //                 self.selectors_cache.insert(current_url.clone(), selectors);
-            //                 (data, false)
-            //             }
-            //         };
-
-            //     println!("추출된 데이터: {:?}", extracted_data);
-            //     // 파일로 저장
-            //     self.save_extracted_data(current_url, &extracted_data)
-            //         .await?;
-
-            //     self.last_seen_page_data = Some(extracted_data.clone());
-
-            //     let status = if is_cached {
-            //         "success (cached)"
-            //     } else {
-            //         "success (new)"
-            //     };
-            //     let msg = history_formatter.format(
-            //         status,
-            //         "Data extraction successful",
-            //         &extracted_data.to_string(),
-            //     );
-
-            //     Ok((LoopControl::Continue, msg))
-            // }
-            AgentAction::ReadFile { filename, .. } => {
-                // 추출 전 기존 데이터는 잊어버리도록 함
-                self.clean_history_data();
-
-                println!("[Action] 파일 읽기 실행: {}", filename);
-                let history_formatter =
-                    HistoryFormatter::new("read", "ReadFile", url_location_before_action);
-
-                if !Path::new(filename).exists() {
-                    let msg = history_formatter.format(
-                        "failed: file not found",
-                        "File check failed",
-                        &format!("File not found: '{}'", filename),
-                    );
-                    return Ok((LoopControl::Continue, msg));
-                }
-
-                match tokio::fs::read_to_string(filename).await {
-                    Ok(content) => {
-                        println!("파일 읽기 완료 ({} bytes)", content.len());
-                        let msg =
-                            history_formatter.format("success", "File read successful", &content);
-                        Ok((LoopControl::Continue, msg))
-                    }
-                    Err(e) => {
-                        let msg = history_formatter.format(
-                            "failed",
-                            "File read error",
-                            &format!("Failed to read file '{}': {}", filename, e),
-                        );
-                        Ok((LoopControl::Continue, msg))
-                    }
-                }
-            }
-
-            AgentAction::WriteFile {
-                filename, content, ..
-            } => {
-                println!("[Action] 파일 쓰기 실행: {}", filename);
-                let history_formatter =
-                    HistoryFormatter::new("write", "WriteFile", url_location_before_action);
-
-                match tokio::fs::write(filename, content).await {
-                    Ok(_) => {
-                        let payload = format!(
-                            "Successfully wrote {} bytes to '{}'",
-                            content.len(),
-                            filename
-                        );
-                        let msg =
-                            history_formatter.format("success", "File write successful", &payload);
-                        Ok((LoopControl::Continue, msg))
-                    }
-                    Err(e) => {
-                        let payload = format!("Failed to write to file '{}': {}", filename, e);
-                        let msg = history_formatter.format("failed", "File write failed", &payload);
-                        Ok((LoopControl::Continue, msg))
-                    }
-                }
-            }
-
             AgentAction::ScrollPage { dy, .. } => {
                 println!("[Action] 페이지 스크롤: dy={}", dy);
                 let history_formatter =
@@ -1305,31 +1169,48 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
                 // 3. TargetItem 참조로 click_element_smart 호출
                 println!("[Action] 클릭 시도: {:?}", &target);
 
+                // 💡 1. 클릭 직전 탭 목록과 '개수' 저장
+                let tabs_before = self.browser.get_tab_list().await.unwrap_or_default();
+                let count_before = tabs_before.len();
+
                 // 2. TargetItem 참조로 click_element_smart 호출
                 match self.click_element_smart(&target).await {
                     Ok(detail_msg) => {
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        // 최대 5초간 새 탭 생성을 폴링(Polling)하며 감지
+                        let mut newly_opened_url = None;
+                        for _ in 0..5 {
+                            tokio::time::sleep(Duration::from_millis(1000)).await;
+                            let tabs_after = self.browser.get_tab_list().await.unwrap_or_default();
+                            // 💡 핵심 1: 탭 개수가 늘어났는지 먼저 확인 (about:blank 상태여도 개수는 늘어남)
+                            if tabs_after.len() > count_before {
+                                // 새로 추가된 탭(보통 가장 마지막 탭)의 URL 선택
+                                if let Some(new_tab) = tabs_after
+                                    .iter()
+                                    .find(|url| !tabs_before.contains(url))
+                                    .or_else(|| tabs_after.last())
+                                {
+                                    // 💡 핵심: 새 탭은 나타났지만 아직 URL 로딩 중(about:blank)이라면 break하지 않고 다음 폴링 대기
+                                    if new_tab != "about:blank" && !new_tab.is_empty() {
+                                        newly_opened_url = Some(new_tab.clone());
+                                        println!(
+                                            "🔗 [Polling Success] Valid URL loaded: {}",
+                                            new_tab
+                                        );
+                                        break;
+                                    } else {
+                                        println!("⏳ [Polling] New tab detected, but URL is still 'about:blank'. Waiting for navigation...");
+                                    }
+                                }
+                            }
+                            println!("🔍 [Polling] New tab not found, waiting...");
+                        }
 
-                        let new_url = self
-                            .page
-                            .current_url()
-                            .await
-                            .unwrap_or_else(|_| url_location_before_action.clone());
-
-                        // 방문 기록 저장
-                        self.mark_visited(&new_url);
-
-                        // 3. 클릭 후 탭 목록 수집
-                        let tabs_after = self.browser.get_tab_list().await.unwrap_or_default();
-
-                        // 3. 기존 목록에 없던 새로운 URL(새 탭) 찾기 (주의: 하나만 찾음. 여러 탭이 열렸을 경우 처리 필요함.)
-                        let newly_opened_url =
-                            tabs_after.iter().find(|url| !tabs_before.contains(url));
+                        // 새로운 탭이 열렸다면, 해당 URL을 클릭하고, 결과를 처리
                         if let Some(new_url) = newly_opened_url {
                             println!("🔗 [Click Success] new updated URL: {}", new_url);
 
                             // 탭 포커스 전환 시도 및 에러 처리
-                            let msg = match self.tab_focus(new_url).await {
+                            let msg = match self.tab_focus(&new_url).await {
                                 Ok(_) => {
                                     println!(
                                         "🎯 [Tab Focus Success] Switched focus to: {}",
@@ -1389,48 +1270,93 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
                 }
             }
 
-            AgentAction::BackPage { .. } => {
+            AgentAction::BackPage {
+                reasoning,
+                backpage_target_url,
+            } => {
                 println!("[Action] 이전 페이지 이동 (BackPage)");
                 let history_formatter =
                     HistoryFormatter::new("back", "BackPage", url_location_before_action);
 
-                match self.page.go_back().await {
-                    Ok(_) => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        let msg = history_formatter.format(
-                            "success",
-                            "Navigated back successfully",
-                            "Successfully navigated back to previous page",
-                        );
-                        Ok((LoopControl::Continue, msg))
+                let url_before = self.page.current_url().await?;
+                println!("[BackPage] URL before BackPage: {}", url_before);
+
+                // 1. 우선 standard go_back 시도
+                let go_back_res = self.page.go_back().await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let url_after = self.page.current_url().await.unwrap_or_default();
+                println!("[BackPage] URL after BackPage: {}", url_after);
+
+                // 2. 만약 go_back 실패했거나, URL이 전혀 바뀌지 않았다면? (새 탭이어서 히스토리가 없는 경우)
+                if go_back_res.is_err() || url_before == url_after {
+                    if go_back_res.is_err() {
+                        println!("[BackPage] Error : {:?}", go_back_res.err());
                     }
-                    Err(e) => {
-                        let msg = history_formatter.format(
-                            "failed",
-                            "Back navigation failed",
-                            &format!("Failed to navigate back: {}", e),
-                        );
-                        Ok((LoopControl::Continue, msg))
+
+                    println!(
+                        "[BackPage] URL Before and after are same?: {}",
+                        url_before == url_after
+                    );
+                    println!("⚠️ [BackPage Fallback] Backpage action failed. This might be a single new tab. Closing current tab...");
+
+                    let open_tabs = self.browser.get_tab_list().await.unwrap_or_default();
+                    // 💡 핵심: LLM이 URL을 주지 않았을 경우(None), 빈 탭(about:blank 등)을 걸러내고 유효한 http/https 탭만 찾아 Fallback으로 사용합니다.
+                    let exact_target_url = backpage_target_url
+                                .clone()
+                                .or_else(|| {
+                                    println!("⚠️ [Auto Fallback] LLM이 target URL을 누락하여 현재 활성화된 유효한 웹 탭을 탐색합니다.");
+                                    open_tabs.iter().find(|&t| {
+                                        t != &url_before && (t.starts_with("http://") || t.starts_with("https://"))
+                                    }).cloned()
+                                });
+
+                    match exact_target_url {
+                        Some(target_url) => {
+                            // ① 현재 탭 닫기 (실패 시 에러 처리)
+                            if let Err(e) = self.page.close().await {
+                                let msg = history_formatter.format(
+                                    "failed",
+                                    "Close tab failed",
+                                    &format!("Failed to close current tab: {}", e),
+                                );
+                                return Ok((LoopControl::Continue, msg));
+                            }
+
+                            // 탭 닫힘 처리가 완료될 때까지 잠시 안정화 대기
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+
+                            // ② 닫기 성공 시 이전/목록 탭으로 스위칭 및 self.page 갱신. 안 하면 닫힌 페이지로 요청을 계속 보내다 오류 남.
+                            self.tab_focus(&target_url).await?;
+
+                            let msg = history_formatter.format(
+                                "success",
+                                "Closed tab & Switched back",
+                                &format!(
+                                    "No history found. Closed current tab and switched back to: {}",
+                                    target_url
+                                ),
+                            );
+                            return Ok((LoopControl::Continue, msg));
+                        }
+                        None => {
+                            // ❌ [실패 처리] 복귀할 backpage_url이 지정되지 않은 경우
+                            println!("❌ [BackPage Failed] No history, No target URL.");
+                            let msg = history_formatter.format(
+                                            "failed",
+                                            "BackPage failed (No history & No target URL)",
+                                            "Cannot go back: This page has no history and no fallback URL was provided. Provide a valid target URL.",
+                                        );
+                            return Ok((LoopControl::Continue, msg));
+                        }
                     }
                 }
-            }
 
-            AgentAction::SelectTab {
-                url,
-                close_previous_tab,
-                reasoning,
-            } => {
-                println!("[Action] 탭 선택: {}", url);
-                let history_formatter = HistoryFormatter::new("select_tab", "Select Tab", url);
-
-                self.browser.go_to_tab(url).await?;
-
+                // 3. 정상적으로 go_back 성공했을 때 처리
                 let msg = history_formatter.format(
                     "success",
-                    "Tab selected",
-                    &format!("Tab selected with URL: {}", url),
+                    "Navigated back successfully",
+                    &format!("Successfully navigated back to {}", url_after),
                 );
-
                 Ok((LoopControl::Continue, msg))
             }
 
@@ -1457,7 +1383,16 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
         lib::page::wait_for_page_load(&*self.page, 5).await?;
         let agent_observation = self.capture_observation().await?;
 
-        if let Err(e) = lib::page::inject_visual_cursor(&*self.page).await {
+        // 방문 기록 저장
+        self.mark_visited(&agent_observation.current_url);
+
+        if let Err(e) = lib::page::inject_visual_cursor(
+            &*self.page,
+            Some(self.last_mouse_x),
+            Some(self.last_mouse_y),
+        )
+        .await
+        {
             eprintln!(
                 "⚠️ [Visual Cursor Warning] 커서 주입 실패 (계속 진행): {}",
                 e
@@ -1580,6 +1515,26 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
             };
             self.history.push(history_entry);
             self.trim_history();
+
+            // 5. Logging
+            let open_tabs = match self.browser.get_tab_list().await {
+                Ok(tabs) => tabs,
+                Err(e) => {
+                    eprintln!("Failed to get tab list: {}", e);
+                    vec![]
+                }
+            };
+            println!("Action is done. Current opened tabs: {:?}", open_tabs);
+
+            let url = match self.page.current_url().await {
+                Ok(url) => url,
+                Err(e) => {
+                    eprintln!("Failed to get current URL: {}", e);
+                    "error".to_string()
+                }
+            };
+            println!("Current focused page: {}", url);
+            println! {"================ Step End ===============\n\n"}
 
             // 5. Termination Check: 작업 종료 판단
             if matches!(control, LoopControl::Finish) {
