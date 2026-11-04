@@ -296,7 +296,6 @@ pub async fn get_target_items<P: PageTrait + ?Sized>(
                         const anchorEl = el.tagName === 'A' ? el : el.closest('a');
                         const targetEl = anchorEl || el; // <a> 태그가 없으면 원본 요소 유지
 
-
                         let target_url = '';
                         if (anchorEl) {{
                             let href = anchorEl.getAttribute('href');
@@ -344,13 +343,49 @@ pub async fn get_target_items<P: PageTrait + ?Sized>(
         schema_json
     );
 
-    let eval_res = page.evaluate(&js_code).await?;
+    let timeout_duration = std::time::Duration::from_secs(5);
+    let max_retries = 3;
 
-    // 💡 hex escape 에러를 방지하기 위해 붕 뜬 백슬래시 및 이스케이프 정제
-    let sanitized_json = eval_res.replace("\\x", "\\\\x"); // 단순 hex 문맥 완화
+    for attempt in 1..=max_retries {
+        let eval_fut = page.evaluate(&js_code);
 
-    let items: Vec<TargetItem> = serde_json::from_str(&sanitized_json)?;
-    Ok(items)
+        match tokio::time::timeout(timeout_duration, eval_fut).await {
+            Ok(Ok(eval_res)) => {
+                let sanitized_json = eval_res.replace("\\x", "\\\\x");
+                match serde_json::from_str::<Vec<TargetItem>>(&sanitized_json) {
+                    Ok(items) => return Ok(items),
+                    Err(e) => {
+                        eprintln!(
+                            "⚠️ [Attempt {}/{}] Failed to deserialize JSON: {}",
+                            attempt, max_retries, e
+                        );
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "⚠️ [Attempt {}/{}] JS execution failed: {}",
+                    attempt, max_retries, e
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "⚠️ [Attempt {}/{}] Evaluation timed out after 5s",
+                    attempt, max_retries
+                );
+            }
+        }
+
+        if attempt < max_retries {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    eprintln!(
+        "[Error] All {} attempts to fetch target items failed. Returning empty list as fallback.",
+        max_retries
+    );
+    Ok(vec![])
 }
 
 pub fn parse_json_from_llm_response(raw_response: &str) -> String {

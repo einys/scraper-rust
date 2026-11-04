@@ -717,7 +717,7 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
         );
 
         // 1. String 분할 (예: 6000자 단위)
-        let chunk_size = 6000;
+        let chunk_size = 3000;
         let dom_chunks = chunk_string(simplified_dom, chunk_size);
         let total_chunks = dom_chunks.len();
         println!(
@@ -787,14 +787,29 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
             let request = GenerationRequest::new(self.model.clone(), user_prompt)
                 .system(system_prompt)
                 .format(FormatType::Json);
-            let llm_response = self.ollama.generate(request).await?;
-            let cleaned_json =
-                lib::page::parse_json_from_llm_response(llm_response.response.trim());
 
-            spinner.finish_with_message("Done!\n");
+            // 10초 타임아웃 설정 (시간은 필요에 따라 조절)
+            let timeout_duration = Duration::from_secs(10);
+
+            let cleaned_json =
+                match tokio::time::timeout(timeout_duration, self.ollama.generate(request)).await {
+                    Ok(Ok(llm_response)) => {
+                        spinner.finish_with_message("Done!\n");
+                        lib::page::parse_json_from_llm_response(llm_response.response.trim())
+                    }
+                    Ok(Err(e)) => {
+                        spinner.finish_with_message("Error during generation, using fallback.\n");
+                        // TODO: 에러 발생 시 사용할 Fallback 값 반환 또는 처리
+                        return Err(e.into());
+                    }
+                    Err(_) => {
+                        spinner.finish_with_message("LLM response timed out, using fallback.\n");
+                        // TODO: 타임아웃 발생 시 사용할 Fallback 값 처리
+                        "".to_string()
+                    }
+                };
 
             println!("Selector response: {:?}", cleaned_json);
-
             // 2. JSON 파싱 (serde_json)
             let parsed_schema: SelectorSchema =
                 serde_json::from_str(&cleaned_json).map_err(|e| {
@@ -1153,12 +1168,6 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
                 let history_formatter =
                     HistoryFormatter::new("click", "ClickElement", url_location_before_action);
 
-                // // 1. obs.target_elements에서 matching 되는 TargetItem 룩업 (없으면 임시 TargetItem 생성)
-                // let matched_item =
-                //     TargetItem::new(selector.to_string(), Some(target_url.clone()), x, y);
-                // 룩업을 하려면 id같은걸 element에 커스텀으로 추가해서 룩업하게 할까? 지금은 일단 받은 파라미터 값 그대로를 쓰기로 한다.
-
-                // target build
                 let target = TargetItem::new(
                     selector.to_string(),
                     target_url.clone(),
@@ -1166,34 +1175,44 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
                     y.unwrap_or(0.0),
                 );
 
-                // 3. TargetItem 참조로 click_element_smart 호출
                 println!("[Action] 클릭 시도: {:?}", &target);
 
-                // 💡 1. 클릭 직전 탭 목록과 '개수' 저장
+                // 💡 1. 클릭 직전 탭 목록 저장
                 let tabs_before = self.browser.get_tab_list().await.unwrap_or_default();
                 let count_before = tabs_before.len();
 
-                // 2. TargetItem 참조로 click_element_smart 호출
                 match self.click_element_smart(&target).await {
                     Ok(detail_msg) => {
-                        // 최대 5초간 새 탭 생성을 폴링(Polling)하며 감지
                         let mut newly_opened_url = None;
+
+                        // 최대 5초간 새 탭 생성을 폴링(Polling)하며 감지
                         for _ in 0..5 {
                             tokio::time::sleep(Duration::from_millis(1000)).await;
                             let tabs_after = self.browser.get_tab_list().await.unwrap_or_default();
-                            // 💡 핵심 1: 탭 개수가 늘어났는지 먼저 확인 (about:blank 상태여도 개수는 늘어남)
+
                             if tabs_after.len() > count_before {
-                                // 새로 추가된 탭(보통 가장 마지막 탭)의 URL 선택
-                                if let Some(new_tab) = tabs_after
-                                    .iter()
-                                    .find(|url| !tabs_before.contains(url))
-                                    .or_else(|| tabs_after.last())
+                                // 💡 핵심 보정 1: Agent가 클릭 대상으로 지정했던 target_url이 탭 목록에 포함되었는지 최우선 확인
+                                let matched_tab = if let Some(ref intended_url) = target.target_url
                                 {
-                                    // 💡 핵심: 새 탭은 나타났지만 아직 URL 로딩 중(about:blank)이라면 break하지 않고 다음 폴링 대기
+                                    tabs_after.iter().find(|url| {
+                                        *url == intended_url || url.contains(intended_url)
+                                    })
+                                } else {
+                                    None
+                                };
+
+                                // 💡 핵심 보정 2: target_url 지정 매칭이 없다면, 이전 탭 목록(tabs_before)에 없던 완전히 새로운 URL 선택
+                                let selected_tab = matched_tab
+                                    .or_else(|| {
+                                        tabs_after.iter().find(|url| !tabs_before.contains(url))
+                                    })
+                                    .or_else(|| tabs_after.last());
+
+                                if let Some(new_tab) = selected_tab {
                                     if new_tab != "about:blank" && !new_tab.is_empty() {
                                         newly_opened_url = Some(new_tab.clone());
                                         println!(
-                                            "🔗 [Polling Success] Valid URL loaded: {}",
+                                            "🔗 [Polling Success] Target or New Tab URL loaded: {}",
                                             new_tab
                                         );
                                         break;
@@ -1205,11 +1224,10 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
                             println!("🔍 [Polling] New tab not found, waiting...");
                         }
 
-                        // 새로운 탭이 열렸다면, 해당 URL을 클릭하고, 결과를 처리
+                        // 새로운 탭 또는 타겟 URL로 포커스 전환
                         if let Some(new_url) = newly_opened_url {
-                            println!("🔗 [Click Success] new updated URL: {}", new_url);
+                            println!("🔗 [Click Success] Target focused URL: {}", new_url);
 
-                            // 탭 포커스 전환 시도 및 에러 처리
                             let msg = match self.tab_focus(&new_url).await {
                                 Ok(_) => {
                                     println!(
@@ -1217,29 +1235,27 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
                                         new_url
                                     );
                                     history_formatter.format(
-                                            "success",
-                                            &format!(
-                                                "Successfully clicked target element and **opened new tab**. Switched focus to: {}",
-                                                new_url
-                                            ),
-                                            &detail_msg,
-                                        )
+                                        "success",
+                                        &format!(
+                                            "Successfully clicked target element and switched focus to: {}",
+                                            new_url
+                                        ),
+                                        &detail_msg,
+                                    )
                                 }
                                 Err(e) => {
                                     eprintln!(
-                                            "⚠️ [Tab Focus Warning] Failed to switch focus to tab '{}': {}",
-                                            new_url, e
-                                        );
-                                    // 포커스 전환에 실패하더라도 루프를 깨지 않고 상황을 History에 정확히 남김
+                                        "⚠️ [Tab Focus Warning] Failed to switch focus to tab '{}': {}",
+                                        new_url, e
+                                    );
                                     history_formatter.format(
-                                            "warning",
-                                            &format!(
-                                                "Clicked element and opened new tab, but **failed to switch focus** to '{}': {}",
-                                                new_url,
-                                                e
-                                            ),
-                                            &detail_msg,
-                                        )
+                                        "warning",
+                                        &format!(
+                                            "Clicked element and opened new tab, but failed to switch focus to '{}': {}",
+                                            new_url, e
+                                        ),
+                                        &detail_msg,
+                                    )
                                 }
                             };
                             Ok((LoopControl::Continue, msg))
@@ -1300,19 +1316,28 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
                     println!("⚠️ [BackPage Fallback] Backpage action failed. This might be a single new tab. Closing current tab...");
 
                     let open_tabs = self.browser.get_tab_list().await.unwrap_or_default();
-                    // 💡 핵심: LLM이 URL을 주지 않았을 경우(None), 빈 탭(about:blank 등)을 걸러내고 유효한 http/https 탭만 찾아 Fallback으로 사용합니다.
+
+                    // 현재 닫힐 탭(url_before)을 제외한 유효한 HTTP/HTTPS 탭 목록 수집
+                    let valid_tabs: Vec<String> = open_tabs
+                        .into_iter()
+                        .filter(|t| {
+                            t != &url_before
+                                && (t.starts_with("http://") || t.starts_with("https://"))
+                        })
+                        .collect();
+
+                    // 💡 핵심 수정 1: LLM이 준 URL이 실제 valid_tabs에 존재하는지(혹은 포함되는지) 느슨하게 검사!
                     let exact_target_url = backpage_target_url
-                                .clone()
-                                .or_else(|| {
-                                    println!("⚠️ [Auto Fallback] LLM이 target URL을 누락하여 현재 활성화된 유효한 웹 탭을 탐색합니다.");
-                                    open_tabs.iter().find(|&t| {
-                                        t != &url_before && (t.starts_with("http://") || t.starts_with("https://"))
-                                    }).cloned()
-                                });
+                                    .clone()
+                                    .filter(|llm_url| valid_tabs.iter().any(|t| t.contains(llm_url) || llm_url.contains(t)))
+                                    .or_else(|| {
+                                        println!("⚠️ [Auto Fallback] LLM target URL이 누락되었거나 현재 열린 탭 목록과 불일치하여 첫 번째 활성 탭으로 폴백합니다.");
+                                        valid_tabs.first().cloned()
+                                    });
 
                     match exact_target_url {
                         Some(target_url) => {
-                            // ① 현재 탭 닫기 (실패 시 에러 처리)
+                            // ① 현재 탭 닫기
                             if let Err(e) = self.page.close().await {
                                 let msg = history_formatter.format(
                                     "failed",
@@ -1325,8 +1350,22 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
                             // 탭 닫힘 처리가 완료될 때까지 잠시 안정화 대기
                             tokio::time::sleep(Duration::from_millis(500)).await;
 
-                            // ② 닫기 성공 시 이전/목록 탭으로 스위칭 및 self.page 갱신. 안 하면 닫힌 페이지로 요청을 계속 보내다 오류 남.
-                            self.tab_focus(&target_url).await?;
+                            // 💡 핵심 수정 2: tab_focus에서 `?` 제거 및 실패 시 강제 복구 로직 추가
+                            if let Err(e) = self.tab_focus(&target_url).await {
+                                println!("⚠️ [Tab Focus Error] 목표 탭({}) 전환 실패: {}. 브라우저의 살아있는 탭으로 강제 전환 시도합니다.", target_url, e);
+
+                                // 최후의 수단: 에러로 튕기기 전에 살아있는 페이지를 확보해 죽은 핸들을 버림
+                                if let Ok(pages) = self.browser.get_tab_list().await {
+                                    if let Some(alive_page) = pages.first() {
+                                        if let Some(page) =
+                                            self.browser.get_page_by_url(alive_page).await?
+                                        {
+                                            self.page = page;
+                                            println!("🔄 [Force Recovery] 살아있는 다른 탭으로 self.page 강제 복구 성공.");
+                                        }
+                                    }
+                                }
+                            }
 
                             let msg = history_formatter.format(
                                 "success",
@@ -1339,7 +1378,7 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
                             return Ok((LoopControl::Continue, msg));
                         }
                         None => {
-                            // ❌ [실패 처리] 복귀할 backpage_url이 지정되지 않은 경우
+                            // ❌ [실패 처리] 복귀할 탭이 완전히 없는 경우
                             println!("❌ [BackPage Failed] No history, No target URL.");
                             let msg = history_formatter.format(
                                             "failed",
@@ -1488,15 +1527,55 @@ impl<'a, B: BrowserTrait> WebAgent<'a, B> {
             let action_name = action.name().to_string();
             let reasoning = action.reasoning().to_string();
 
-            // 3. Act: 행동 수행 및 결과 메시지 수집
-            let (control, result_summary) =
-                match self.handle_action(&action, &agent_observation).await {
-                    Ok(res) => res,
-                    Err(e) => (
-                        LoopControl::Continue,
-                        format!("Critical action execution error: {}", e),
+            // 3. Act: 행동 수행 및 결과 메시지 수집 30초 타임아웃, 최대 3회 재시도)
+            let timeout_duration = std::time::Duration::from_secs(30);
+            let max_retries = 3;
+            let mut action_result = None;
+
+            for attempt in 1..=max_retries {
+                match tokio::time::timeout(
+                    timeout_duration,
+                    self.handle_action(&action, &agent_observation),
+                )
+                .await
+                {
+                    Ok(Ok(res)) => {
+                        action_result = Some(res);
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!(
+                            "⚠️ [Attempt {}/{}] Action execution error: {}",
+                            attempt, max_retries, e
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "⚠️ [Attempt {}/{}] Action execution timed out after 5s",
+                            attempt, max_retries
+                        );
+                    }
+                }
+
+                if attempt < max_retries {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+
+            // Action 3회 재시도 실패 시 Fallback 처리
+            let (control, result_summary) = action_result.unwrap_or_else(|| {
+                eprintln!(
+                    "☠️ [Action Failed] All {} attempts for handle_action failed. Using fallback loop control.",
+                    max_retries
+                );
+                (
+                    LoopControl::Continue,
+                    format!(
+                        "Critical action execution error: Timed out or failed after {} retries",
+                        max_retries
                     ),
-                };
+                )
+            });
 
             // Extract data from result_summary if it exists
             let data = if result_summary.contains("Data: ") {

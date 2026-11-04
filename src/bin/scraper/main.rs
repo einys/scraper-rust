@@ -1,14 +1,15 @@
-use std::sync::Arc;
-use std::time::Duration;
-
+use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::input::MouseButton;
 use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::layout::Point;
 use chromiumoxide::Page;
-use futures::StreamExt; // tokio_stream 대신 이것 하나로 통합
-
-use async_trait::async_trait;
+use futures::StreamExt;
+/// 지정한 (x, y) 좌표로 자연스럽게 마우스 커서를 이동시킵니다.
+use rand::Rng;
+use rand::RngExt; // random_range() 메소드가 속한 트레이트
+use std::sync::Arc;
+use std::time::Duration; // tokio_stream 대신 이것 하나로 통합
 
 // 로그에 현재시간 기록
 #[macro_export]
@@ -203,7 +204,9 @@ impl PageTrait for ChromiumPageAdapter {
         );
         Ok(())
     }
+
     /// 지정한 (x, y) 좌표로 자연스럽게 마우스 커서를 이동시킵니다.
+    /// 이동 과정에서 2~3개의 무작위 중간 경유점을 거쳐가며 노이즈를 크게 부여합니다.
     async fn move_cursor_at(
         &self,
         x: f64,
@@ -211,41 +214,180 @@ impl PageTrait for ChromiumPageAdapter {
         start_x: Option<f64>,
         start_y: Option<f64>,
     ) -> DynResult<()> {
-        // 자연스러운 이동을 위한 프레임 스텝 분할
-        let steps = 15;
-        let duration_ms = 150;
-        let step_delay = Duration::from_millis(duration_ms / steps);
-
         // 💡 start_x/y가 없으면 목표 지점(x, y)을 시작 지점으로 사용
         let start_x = start_x.unwrap_or(x);
         let start_y = start_y.unwrap_or(y);
 
-        for i in 1..=steps {
-            let progress = i as f64 / steps as f64;
+        let total_dx = x - start_x;
+        let total_dy = y - start_y;
+        let total_dist = (total_dx * total_dx + total_dy * total_dy).sqrt();
 
-            // Ease-Out 삼차 보간법 (자연스러운 감속 이동 연출)
-            let ease = 1.0 - (1.0 - progress).powi(3);
+        // 방황할 경유점들 랜덤 생성
+        // 거리 상수가 너무 짧으면 경유점 없이 직접 이동하도록 처리 (최소 20px 이상일 때만 경유)
+        // 💡 블록 스코프로 rng를 감싸 await 전 난수 생성을 종료하여 Send 에러 방지
+        let waypoints = if total_dist > 20.0 {
+            let (waypoint_count, dev_scales, offsets) = {
+                let mut rng = rand::rng();
+                let count = rng.random_range(2..=3);
+                let dev = (total_dist * 0.35).clamp(15.0, 120.0);
 
-            let curr_x = start_x + (x - start_x) * ease;
-            let curr_y = start_y + (y - start_y) * ease;
+                let mut raw_offsets = Vec::with_capacity(count);
+                for _ in 0..count {
+                    raw_offsets.push((rng.random_range(-dev..=dev), rng.random_range(-dev..=dev)));
+                }
+                (count, dev, raw_offsets)
+            };
 
-            self.page
-                .move_mouse(Point {
-                    x: curr_x,
-                    y: curr_y,
-                })
-                .await?;
+            let mut points = Vec::with_capacity(waypoint_count + 1);
+            for (idx, (offset_x, offset_y)) in offsets.into_iter().enumerate() {
+                let progress = (idx + 1) as f64 / (waypoint_count + 1) as f64;
+                let base_wp_x = start_x + total_dx * progress;
+                let base_wp_y = start_y + total_dy * progress;
 
-            tokio::time::sleep(step_delay).await;
+                points.push((base_wp_x + offset_x, base_wp_y + offset_y));
+            }
+            points.push((x, y));
+            points
+        } else {
+            vec![(x, y)]
+        };
+
+        let mut current_from_x = start_x;
+        let mut current_from_y = start_y;
+
+        // 경유점들을 순차적으로 거쳐서 이동
+        for (wp_idx, &(target_x, target_y)) in waypoints.iter().enumerate() {
+            let dx = target_x - current_from_x;
+            let dy = target_y - current_from_y;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            // 자연스러운 이동을 위한 프레임 스텝 분할 (경유점당 15 스텝)
+            let steps = 15;
+            let duration_ms = 150;
+
+            // 1. 휘어짐(Control Point) 및 방황 시점 결정 (동기 블록 내에서 생성)
+            let (control_offset_x, control_offset_y, wander_step_1, wander_step_2) = {
+                let mut rng = rand::rng();
+                let arc_magnitude = (dist * 0.40).clamp(10.0, 80.0);
+                (
+                    rng.random_range(-arc_magnitude..=arc_magnitude),
+                    rng.random_range(-arc_magnitude..=arc_magnitude),
+                    rng.random_range(3..=6),
+                    rng.random_range(8..=12),
+                )
+            };
+
+            // 누적 방황 오프셋 (방황 후 천천히 복귀하기 위함)
+            let mut wander_drift_x = 0.0;
+            let mut wander_drift_y = 0.0;
+
+            for i in 1..=steps {
+                let progress = i as f64 / steps as f64;
+
+                // Ease-Out 삼차 보간법 (자연스러운 감속 이동 연출)
+                let ease = 1.0 - (1.0 - progress).powi(3);
+
+                // 기본 휘어지는 주 궤적
+                let base_x = current_from_x + dx * ease + control_offset_x * (1.0 - ease) * ease;
+                let base_y = current_from_y + dy * ease + control_offset_y * (1.0 - ease) * ease;
+
+                // 2. 스텝별 방황/노이즈/딜레이 값 동기 블록 계산 (await 지점과 rng 분리)
+                let (w_impulse, jitter, step_delay_ms) = {
+                    let mut rng = rand::rng();
+
+                    // 방황 벡터 계산
+                    let impulse = if i == wander_step_1 || i == wander_step_2 {
+                        let wander_scale = (dist * 0.15).clamp(5.0, 25.0);
+                        Some((
+                            rng.random_range(-wander_scale..=wander_scale),
+                            rng.random_range(-wander_scale..=wander_scale),
+                        ))
+                    } else {
+                        None
+                    };
+
+                    // 지터 노이즈 계산 (노이즈 강도 상향: 8.0)
+                    let noise_scale = (1.0 - ease) * 8.0;
+                    let j = if noise_scale > 0.1 {
+                        (
+                            rng.random_range(-noise_scale..=noise_scale),
+                            rng.random_range(-noise_scale..=noise_scale),
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    };
+
+                    // 스텝 딜레이 계산
+                    let base_delay = duration_ms / steps;
+                    let delay = if i == wander_step_1
+                        || i == wander_step_2
+                        || rng.random_range(0..100) < 15
+                    {
+                        rng.random_range(30..=80)
+                    } else {
+                        let variance = rng.random_range(50..=150);
+                        (base_delay * variance) / 100
+                    };
+
+                    (impulse, j, delay)
+                };
+
+                // 3. 방황 오프셋 갱신
+                if let Some((w_x, w_y)) = w_impulse {
+                    wander_drift_x += w_x;
+                    wander_drift_y += w_y;
+                } else {
+                    wander_drift_x *= 0.70;
+                    wander_drift_y *= 0.70;
+                }
+
+                let (jitter_x, jitter_y) = jitter;
+
+                // 최종 프레임 좌표 (마지막 스텝은 정확한 목적지)
+                let (curr_x, curr_y) = if i == steps {
+                    (target_x, target_y)
+                } else {
+                    (
+                        base_x + wander_drift_x + jitter_x,
+                        base_y + wander_drift_y + jitter_y,
+                    )
+                };
+
+                // 💡 await 호출 시 스코프에 rng 관련 참조가 일절 남아있지 않아 안전합니다.
+                self.page
+                    .move_mouse(Point {
+                        x: curr_x,
+                        y: curr_y,
+                    })
+                    .await?;
+
+                tokio::time::sleep(Duration::from_millis(step_delay_ms as u64)).await;
+            }
+
+            // 다음 구간 출발지를 현재 도달한 경유지로 업데이트
+            current_from_x = target_x;
+            current_from_y = target_y;
+
+            // 경유점 교체 시 미세 멈춤 (최종 목적지 도달 전 경유점 전환 시점에만)
+            if wp_idx < waypoints.len() - 1 {
+                let pause_ms = {
+                    let mut rng = rand::rng();
+                    rng.random_range(20..=60)
+                };
+                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+            }
         }
 
         println!(
-            "Mouse moved from ({},{}) to ({}, {})",
-            start_x, start_y, x, y
+            "Mouse moved from ({},{}) to ({}, {}) via {} waypoints",
+            start_x,
+            start_y,
+            x,
+            y,
+            waypoints.len() - 1
         );
         Ok(())
     }
-
     /// 지정한 선택자(selector)의 엘리먼트가 DOM에 나타날 때까지 대기합니다.
     /// timeout이 None일 경우 기본값(예: 30초) 동안 대기합니다.
     async fn wait_for_element(&self, selector: &str, timeout: Option<Duration>) -> DynResult<()> {
@@ -333,11 +475,11 @@ async fn main() -> DynResult<()> {
     // Goal prompt
     let llm_host = "http://localhost";
     let llm_port = 31434;
-    let llm_model = "qwen2.5-coder:14b";
+    let llm_model = "mistral:7b";
     let system_prompt = format!("You are an automated web agent and data extraction assistant.
-            Only from {} domain, crawl 50 item pages. You navigate into each item detail routes, and then, **route back to the list**.
-            If you are hitting same target_url for more than 3 steps, go back and navigate other pages.
-            If you have no interesting html selector in the page, go back and navigate other pages.
+            Only from {} domain, crawl item pages. You navigate into each item detail routes, and then, **route back to the list**.
+            If you are hitting same target_url for more than 3 steps, go back.
+            If you have no interesting html selector in the page, 1. scroll down 1000px, if still not, 2. **go back page**.
             [CRITICAL INSTRUCTION]
             -Never click external domain url. Only stuck into {} domain.
             -You MUST answer ALL queries EXCLUSIVELY in English.", target_webpage, target_webpage);
